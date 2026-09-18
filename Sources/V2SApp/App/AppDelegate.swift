@@ -54,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model: appModel,
             showTranscript: { [weak self] in
                 self?.transcriptWindowController.showTranscript()
+            },
+            openControls: { [weak settingsWindowController] in
+                settingsWindowController?.showSettings()
             }
         )
         let statusBarController = StatusBarController(
@@ -84,6 +87,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .removeDuplicates()
             .sink { [weak self] state in
                 self?.updateSourceRefreshTimer(for: state)
+                if state == .running {
+                    self?.showMenuBarHintIfNeeded()
+                }
+            }
+            .store(in: &cancellables)
+
+        // 「Dock に表示」設定を Dock の可視性へ反映する（初期値は購読時に流れる）。
+        appModel.$showInDock
+            .removeDuplicates()
+            .sink { [weak self] show in
+                self?.dockVisibilityController.setVisible(show, for: .userPreference)
             }
             .store(in: &cancellables)
     }
@@ -351,6 +365,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         for application in applications where application.isTerminated == false {
             application.forceTerminate()
+        }
+    }
+
+    // MARK: - First-run menu-bar hint
+
+    private static let menuBarHintShownKey = "v2s.menuBarHintShown"
+
+    /// メニューバー常駐アプリは「アプリがどこにあるか分からない」で迷子になりやすい。初回セッション
+    /// 開始時に一度だけ、メニューバーのアイコンから操作できることを知らせる（Dock 表示の案内も）。
+    private func showMenuBarHintIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: Self.menuBarHintShownKey) == false else {
+            return
+        }
+        defaults.set(true, forKey: Self.menuBarHintShownKey)
+
+        // sink の中で同期モーダルを回さない（セッション開始をブロックしないため非同期化）。
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "v2s runs in the menu bar"
+            alert.informativeText = """
+            The subtitle bar is showing now, but the v2s app itself lives in the menu bar — \
+            look for the caption-bubble icon near the top-right of your screen.
+
+            Click that icon anytime to change languages, open Settings, or stop.
+
+            Prefer a Dock icon instead? Turn on “Show icon in Dock” in Settings.
+            """
+            alert.addButton(withTitle: "Got it")
+            alert.runModal()
         }
     }
 

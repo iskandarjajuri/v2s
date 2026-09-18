@@ -15,7 +15,69 @@ struct RecognizedSentence: Equatable, Sendable {
     }
 }
 
+/// キャプチャ経路の健全性。`LiveTranscriptionSession` の watchdog が 2 秒ごとに評価する。
+///
+/// 従来の watchdog は「音は来ているのに ASR の結果が途絶えた」ケース（`pipelineStalled`）しか
+/// 見ていなかった。そのため **音がまったく来ない**障害（Bluetooth ヘッドセットの接続・切断や
+/// A2DP↔HFP の切り替えで既定の出力デバイスが変わり、集約デバイスの sub-device が無効になる、
+/// あるいは開始時に解決したプロセス集合が音を出していない）では VAD が一度も発火せず、
+/// `speechPresent` が永久に false のまま watchdog が沈黙し、UI が「音声待ち」のまま固まった。
+/// `audioStarved` と `captureSilent` はその死角を塞ぐためのもの。
+enum CaptureHealthVerdict: Equatable {
+    /// 正常。
+    case healthy
+    /// IOProc からバッファがまったく届かない（出力デバイスが入れ替わった等）。
+    case audioStarved
+    /// バッファは届くが、このセッションで一度も実音声が入っていない
+    /// （タップ先のプロセス集合が音を出していない等）。
+    case captureSilent
+    /// 音は来ているのに ASR の結果が途絶えた（従来からの検出）。
+    case pipelineStalled
+}
+
 final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
+    /// watchdog の判定本体。副作用を持たない純関数にしてあるのでそのままテストできる
+    /// （`LegacyRecognitionErrorDisposition` と同じ方針）。
+    ///
+    /// 判定順序に意味がある。まず「そもそも音が届いているか」を見て、次に「届いた音に中身が
+    /// あるか」を見て、最後に従来の ASR 詰まりを見る。逆順にすると、音が来ていない状態を
+    /// ASR の問題と誤診する。
+    static func captureHealthVerdict(
+        now: Date,
+        captureStartTime: Date,
+        lastAudioBufferTime: Date,
+        lastRecognitionResultTime: Date,
+        lastSpeechActivityTime: Date,
+        hasEverReceivedNonSilentAudio: Bool,
+        audioStarvationTimeout: TimeInterval,
+        silentCaptureTimeout: TimeInterval,
+        resultTimeout: TimeInterval,
+        speechRecency: TimeInterval
+    ) -> CaptureHealthVerdict {
+        let sinceStart = now.timeIntervalSince(captureStartTime)
+
+        // 1) バッファ自体が途絶えた。開始直後の猶予を与えるため sinceStart も見る。
+        if sinceStart > audioStarvationTimeout,
+           now.timeIntervalSince(lastAudioBufferTime) > audioStarvationTimeout {
+            return .audioStarved
+        }
+
+        // 2) バッファは来ているが、このセッションで一度も実音声が無い。
+        //    「一度も」に限定するのは、正常に動いた後の静寂（会議の間）で誤検出しないため。
+        if hasEverReceivedNonSilentAudio == false, sinceStart > silentCaptureTimeout {
+            return .captureSilent
+        }
+
+        // 3) 従来の判定：発話は来ているのに結果が途絶えた。
+        let noResults = now.timeIntervalSince(lastRecognitionResultTime) > resultTimeout
+        let speechPresent = now.timeIntervalSince(lastSpeechActivityTime) < speechRecency
+        if noResults, speechPresent {
+            return .pipelineStalled
+        }
+
+        return .healthy
+    }
+
     enum LegacyRecognitionErrorDisposition: Equatable {
         case ignore
         case restartImmediately
@@ -215,6 +277,32 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var highPassPreviousInput: Float = 0.0
     private var highPassPreviousOutput: Float = 0.0
 
+    // MARK: Stall watchdog (captureQueue)
+    // 発話（VAD）は来ているのに ASR の結果が一定時間途絶えたら「詰まり」とみなす。legacy / modern
+    // どちらのバックエンドでも起こり得る「沈黙ウェッジ」「results ストリームの静かな終了」を
+    // 横断的に検出するための最後の砦。検出したら stallHandler で所有者（AppModel）に通知し、
+    // 所有者がセッションを作り直す（＝新しいインスタンスで watchdog も張り直される）。
+    private var lastSpeechActivityTime = Date.distantPast
+    // 「音そのものが届いているか」を見るための時刻。append(audioBuffer:) で更新する。
+    private var lastAudioBufferTime = Date.distantPast
+    private var captureStartTime = Date.distantPast
+    // デジタル無音（タップに中身が無い）と、実音声が一度でも入ったかを区別する。
+    private var hasEverReceivedNonSilentAudio = false
+    private var watchdogTimer: DispatchSourceTimer?
+    // 書き込みは start() で一度きり（watchdog を captureQueue に積む前）。以後は checkForStall()
+    // が captureQueue 上で読むのみ。teardown で nil する場合は cancelWatchdog() 内（＝ captureQueue）で。
+    private var stallHandler: (@MainActor (CaptureHealthVerdict) -> Void)?
+    private let stallResultTimeout: TimeInterval = 10
+    private let stallSpeechRecency: TimeInterval = 3
+    private let watchdogInterval: TimeInterval = 2
+    /// バッファが完全に途絶えてから異常とみなすまで。出力デバイスの切り替えは数秒で復帰させたい。
+    private let audioStarvationTimeout: TimeInterval = 6
+    /// 一度も実音声が入らないまま経過したら異常とみなすまで。開始直後にアプリが無音なのは
+    /// 正常なので、`audioStarvationTimeout` より長く取る。
+    private let silentCaptureTimeout: TimeInterval = 25
+    /// これ以下のピークはデジタル無音（タップに中身が無い）とみなす。
+    private let digitalSilencePeak: Float = 0.0005
+
     private func runOnCaptureQueue<T>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             captureQueue.async {
@@ -241,7 +329,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void,
-        fatalErrorHandler: @escaping @MainActor (String) -> Void
+        fatalErrorHandler: @escaping @MainActor (String) -> Void,
+        onStall: (@MainActor (CaptureHealthVerdict) -> Void)? = nil
     ) async throws {
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
@@ -251,6 +340,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         self.interfaceLanguageID = interfaceLanguageID
         self.errorHandler = errorHandler
         self.fatalErrorHandler = fatalErrorHandler
+        self.stallHandler = onStall
         await MainActor.run {
             recentCommittedSentenceHistory.removeAll()
         }
@@ -275,6 +365,66 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 try self.startApplicationAudioCapture(descriptor: captureDescriptor)
             }
         }
+
+        captureQueue.async { [weak self] in
+            self?.startWatchdog()
+        }
+    }
+
+    // MARK: - Stall watchdog
+
+    /// captureQueue で回す監視タイマー。開始時に lastRecognitionResultTime を「今」に置き直し、
+    /// 最初の結果までの猶予（stallResultTimeout）を与える。
+    private func startWatchdog() {
+        cancelWatchdog()
+        let now = Date()
+        lastRecognitionResultTime = now
+        lastSpeechActivityTime = Date.distantPast
+        // 開始時刻とバッファ時刻を「今」に置くことで、起動直後に誤検出しない猶予を作る。
+        captureStartTime = now
+        lastAudioBufferTime = now
+        hasEverReceivedNonSilentAudio = false
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now() + watchdogInterval, repeating: watchdogInterval)
+        timer.setEventHandler { [weak self] in
+            self?.checkForStall()
+        }
+        watchdogTimer = timer
+        timer.resume()
+    }
+
+    private func cancelWatchdog() {
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
+    }
+
+    /// 発話は最近あった（stallSpeechRecency 以内）のに、結果が stallResultTimeout を超えて
+    /// 途絶えているなら「詰まり」。一度検出したら自分を止め、所有者へ通知する（重複通知を防ぐ）。
+    private func checkForStall() {
+        let verdict = Self.captureHealthVerdict(
+            now: Date(),
+            captureStartTime: captureStartTime,
+            lastAudioBufferTime: lastAudioBufferTime,
+            lastRecognitionResultTime: lastRecognitionResultTime,
+            lastSpeechActivityTime: lastSpeechActivityTime,
+            hasEverReceivedNonSilentAudio: hasEverReceivedNonSilentAudio,
+            audioStarvationTimeout: audioStarvationTimeout,
+            silentCaptureTimeout: silentCaptureTimeout,
+            resultTimeout: stallResultTimeout,
+            speechRecency: stallSpeechRecency
+        )
+
+        guard verdict != .healthy else {
+            return
+        }
+
+        cancelWatchdog()
+        guard let stallHandler else {
+            return
+        }
+        Task { @MainActor in
+            stallHandler(verdict)
+        }
     }
 
     func stop() {
@@ -297,6 +447,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func stopOnCaptureQueue() {
+        cancelWatchdog()
         cancelSilenceTimer()
         cancelVADSilenceTimer()
 
@@ -828,6 +979,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func append(audioBuffer: AVAudioPCMBuffer) {
+        // バッファが「届いた」こと自体を先に記録する。中身が無音でも IOProc は生きている、
+        // という区別が watchdog の audioStarved / captureSilent の切り分けになる。
+        lastAudioBufferTime = Date()
+
         guard audioBuffer.frameLength > 0 else {
             return
         }
@@ -837,11 +992,19 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
+        if audioLevels.peak > digitalSilencePeak {
+            hasEverReceivedNonSilentAudio = true
+        }
         boostIfQuiet(buffer: processingBuffer, levels: audioLevels)
 
         if let vadEngine {
             let vadResult = vadEngine.process(buffer: processingBuffer)
             lastVADProbability = vadResult.speechProbability
+
+            // 詰まり検出用：発話が来ていることを記録する（結果が途絶えても音は来ている、を判定するため）。
+            if vadResult.speechProbability > 0.5 {
+                lastSpeechActivityTime = Date()
+            }
 
             if vadResult.containsSpeechOffset {
                 scheduleVADSilenceCommit()

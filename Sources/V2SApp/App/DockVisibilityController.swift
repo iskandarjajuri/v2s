@@ -4,6 +4,8 @@ import AppKit
 final class DockVisibilityController {
     enum Reason: Hashable {
         case settingsWindow
+        // ユーザー設定「Dock に表示」。ON の間は Settings を閉じても .regular を保つ。
+        case userPreference
     }
 
     private var reasons = Set<Reason>()

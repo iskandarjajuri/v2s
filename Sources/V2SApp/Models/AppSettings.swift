@@ -12,19 +12,22 @@ struct AppSettings: Codable {
     var subtitleMode: SubtitleMode
     var subtitleDisplayMode: SubtitleDisplayMode
     var glossary: [String: String]
+    // 有効にすると Dock にアプリアイコンを常時表示する（.regular）。既定は menu-bar 専用（.accessory）。
+    var showInDock: Bool
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
         selectedSourceIDs: [],
         sourceLanguageOverrides: [:],
         sourceOutputLanguageOverrides: [:],
-        inputLanguageID: "en",
-        outputLanguageID: "zh-Hans",
+        inputLanguageID: "ja",
+        outputLanguageID: "id",
         interfaceLanguageID: nil,
         overlayStyle: .default,
         subtitleMode: .balanced,
         subtitleDisplayMode: .both,
-        glossary: [:]
+        glossary: [:],
+        showInDock: false
     )
 
     // Custom decoder so existing settings files load cleanly as new fields are added.
@@ -51,6 +54,8 @@ struct AppSettings: Codable {
             ?? AppSettings.default.subtitleDisplayMode
         glossary = (try? c.decodeIfPresent([String: String].self, forKey: .glossary))
             ?? AppSettings.default.glossary
+        showInDock = (try? c.decodeIfPresent(Bool.self, forKey: .showInDock))
+            ?? AppSettings.default.showInDock
     }
 
     init(
@@ -64,7 +69,8 @@ struct AppSettings: Codable {
         overlayStyle: OverlayStyle,
         subtitleMode: SubtitleMode,
         subtitleDisplayMode: SubtitleDisplayMode,
-        glossary: [String: String]
+        glossary: [String: String],
+        showInDock: Bool = false
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -77,5 +83,6 @@ struct AppSettings: Codable {
         self.subtitleMode     = subtitleMode
         self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
+        self.showInDock       = showInDock
     }
 }

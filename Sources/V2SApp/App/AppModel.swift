@@ -76,6 +76,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var applicationSources: [InputSource] = []
     @Published private(set) var microphoneSources: [InputSource] = []
     @Published private(set) var sessionState: SessionState = .idle
+    /// 詰まりを検出して自動再接続している最中か。UI（メニューバーアイコン等）の表示に使う。
+    @Published private(set) var isReconnecting = false
+    /// 自動再接続の連打を防ぐためのクールダウン基準時刻。
+    private var lastStallRecoveryTime = Date.distantPast
+    /// 再接続の startSession() が実行中か。async な再起動が自分自身と多重に走るのを防ぐ。
+    private var isRestartingAfterStall = false
     @Published private(set) var statusMessage = ""
     @Published private(set) var overlayState: OverlayPreviewState?
     @Published private(set) var languageResourceStatuses: [LanguageResourceStatus] = []
@@ -187,6 +193,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Dock にアプリアイコンを常時表示するか。AppDelegate が監視して DockVisibilityController に反映する。
+    @Published var showInDock: Bool {
+        didSet {
+            persistSettings()
+        }
+    }
+
     init(
         settingsStore: SettingsStore,
         sourceCatalogService: SourceCatalogService
@@ -214,6 +227,7 @@ final class AppModel: ObservableObject {
         self.subtitleMode = settings.subtitleMode
         self.subtitleDisplayMode = settings.subtitleDisplayMode
         self.glossary = settings.glossary
+        self.showInDock = settings.showInDock
         self.translationHostConfiguration = nil
         AppLocalization.updateEmbeddedBundleLocalizationLanguageID(self.interfaceLanguageID)
 
@@ -657,6 +671,9 @@ final class AppModel: ObservableObject {
                             return
                         }
                         fatalSessionErrors.append((message, sessionID, source.name))
+                    },
+                    onStall: { [weak self] verdict in
+                        self?.handlePipelineStall(verdict)
                     }
                 )
 
@@ -777,9 +794,50 @@ final class AppModel: ObservableObject {
         resetLiveTextPipeline()
         stopLiveTranscriptionSessions()
         sessionState = .idle
+        isReconnecting = false
+        isRestartingAfterStall = false
         setStatus(allSources.isEmpty ? .noInputSourcesDetected : .ready)
         isOverlayVisible = false
         overlayState = nil
+    }
+
+    /// パイプラインの詰まり（音は来ているのに ASR の結果が途絶えた）を検出した時の復旧。
+    /// セッションを丸ごと作り直す（stop→start）ことで、legacy / modern どちらのウェッジも確実に解く。
+    /// 連打を避けるためクールダウンを設け、再接続中は isReconnecting を立てて UI に見せる。
+    private func handlePipelineStall(_ verdict: CaptureHealthVerdict) {
+        // startSession() は async なので、再起動が完了する前に別ソースの watchdog が
+        // 再度 stall を報告し得る。isRestartingAfterStall で多重起動を確実に防ぐ
+        // （クールダウンだけだと再起動中の T+12s 以降に隙間ができる）。
+        guard sessionState == .running, isRestartingAfterStall == false else {
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(lastStallRecoveryTime) > 12 else {
+            return
+        }
+        lastStallRecoveryTime = now
+        isRestartingAfterStall = true
+        isReconnecting = true
+
+        // 再起動は stop→start なので、出力デバイス（集約デバイスの sub-device）と
+        // タップ対象のプロセス集合の両方が解決し直される。Bluetooth の切り替えで
+        // 出力先が変わった場合も、開始時に音を出していないプロセスを掴んでいた場合も、
+        // この一本の復旧経路で直る。
+        switch verdict {
+        case .audioStarved:
+            Logger.session.warning("Capture starved (no audio buffers) — rebuilding capture")
+        case .captureSilent:
+            Logger.session.warning("Capture silent (buffers arriving but no audio this session) — rebuilding capture")
+        case .pipelineStalled:
+            Logger.session.warning("Pipeline stalled (speech present, no ASR results) — restarting session")
+        case .healthy:
+            break
+        }
+
+        Task { [weak self] in
+            await self?.startSession()
+            self?.isRestartingAfterStall = false
+        }
     }
 
     private func stopLiveTranscriptionSessions() {
@@ -874,7 +932,8 @@ final class AppModel: ObservableObject {
             overlayStyle: overlayStyle,
             subtitleMode: subtitleMode,
             subtitleDisplayMode: subtitleDisplayMode,
-            glossary: glossary
+            glossary: glossary,
+            showInDock: showInDock
         )
 
         settingsStore.save(settings)
@@ -2048,6 +2107,10 @@ final class AppModel: ObservableObject {
 
         if sessionState != .running {
             sessionState = .running
+        }
+        // 結果が戻ってきた＝復旧。再接続インジケータを下ろす。
+        if isReconnecting {
+            isReconnecting = false
         }
 
         setStatus(.running(sourceName: activeSourceDisplayName))
