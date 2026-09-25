@@ -3,7 +3,12 @@ import AVFoundation
 import CoreAudio
 import CoreMedia
 import Foundation
+import os.log
 import Speech
+
+private extension Logger {
+    static let capture = Logger(subsystem: "com.franklioxygen.v2s", category: "capture")
+}
 
 struct RecognizedSentence: Equatable, Sendable {
     let text: String
@@ -15,69 +20,7 @@ struct RecognizedSentence: Equatable, Sendable {
     }
 }
 
-/// キャプチャ経路の健全性。`LiveTranscriptionSession` の watchdog が 2 秒ごとに評価する。
-///
-/// 従来の watchdog は「音は来ているのに ASR の結果が途絶えた」ケース（`pipelineStalled`）しか
-/// 見ていなかった。そのため **音がまったく来ない**障害（Bluetooth ヘッドセットの接続・切断や
-/// A2DP↔HFP の切り替えで既定の出力デバイスが変わり、集約デバイスの sub-device が無効になる、
-/// あるいは開始時に解決したプロセス集合が音を出していない）では VAD が一度も発火せず、
-/// `speechPresent` が永久に false のまま watchdog が沈黙し、UI が「音声待ち」のまま固まった。
-/// `audioStarved` と `captureSilent` はその死角を塞ぐためのもの。
-enum CaptureHealthVerdict: Equatable {
-    /// 正常。
-    case healthy
-    /// IOProc からバッファがまったく届かない（出力デバイスが入れ替わった等）。
-    case audioStarved
-    /// バッファは届くが、このセッションで一度も実音声が入っていない
-    /// （タップ先のプロセス集合が音を出していない等）。
-    case captureSilent
-    /// 音は来ているのに ASR の結果が途絶えた（従来からの検出）。
-    case pipelineStalled
-}
-
 final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
-    /// watchdog の判定本体。副作用を持たない純関数にしてあるのでそのままテストできる
-    /// （`LegacyRecognitionErrorDisposition` と同じ方針）。
-    ///
-    /// 判定順序に意味がある。まず「そもそも音が届いているか」を見て、次に「届いた音に中身が
-    /// あるか」を見て、最後に従来の ASR 詰まりを見る。逆順にすると、音が来ていない状態を
-    /// ASR の問題と誤診する。
-    static func captureHealthVerdict(
-        now: Date,
-        captureStartTime: Date,
-        lastAudioBufferTime: Date,
-        lastRecognitionResultTime: Date,
-        lastSpeechActivityTime: Date,
-        hasEverReceivedNonSilentAudio: Bool,
-        audioStarvationTimeout: TimeInterval,
-        silentCaptureTimeout: TimeInterval,
-        resultTimeout: TimeInterval,
-        speechRecency: TimeInterval
-    ) -> CaptureHealthVerdict {
-        let sinceStart = now.timeIntervalSince(captureStartTime)
-
-        // 1) バッファ自体が途絶えた。開始直後の猶予を与えるため sinceStart も見る。
-        if sinceStart > audioStarvationTimeout,
-           now.timeIntervalSince(lastAudioBufferTime) > audioStarvationTimeout {
-            return .audioStarved
-        }
-
-        // 2) バッファは来ているが、このセッションで一度も実音声が無い。
-        //    「一度も」に限定するのは、正常に動いた後の静寂（会議の間）で誤検出しないため。
-        if hasEverReceivedNonSilentAudio == false, sinceStart > silentCaptureTimeout {
-            return .captureSilent
-        }
-
-        // 3) 従来の判定：発話は来ているのに結果が途絶えた。
-        let noResults = now.timeIntervalSince(lastRecognitionResultTime) > resultTimeout
-        let speechPresent = now.timeIntervalSince(lastSpeechActivityTime) < speechRecency
-        if noResults, speechPresent {
-            return .pipelineStalled
-        }
-
-        return .healthy
-    }
-
     enum LegacyRecognitionErrorDisposition: Equatable {
         case ignore
         case restartImmediately
@@ -117,6 +60,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private struct CommittedEmission {
         let text: String
         let promotionSegmentID: UUID?
+    }
+
+    private struct ApplicationProcessCandidate: Equatable {
+        let objectID: AudioObjectID
+        let isRunningOutput: Bool
     }
 
     private struct ApplicationCaptureDescriptor: Sendable {
@@ -283,23 +231,39 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     // 横断的に検出するための最後の砦。検出したら stallHandler で所有者（AppModel）に通知し、
     // 所有者がセッションを作り直す（＝新しいインスタンスで watchdog も張り直される）。
     private var lastSpeechActivityTime = Date.distantPast
+    // 認識器が最後に結果を返した時刻（watchdog 専用）。lastRecognitionResultTime は下書き処理が
+    // 文を確定するたびに resetDraftState() で .distantPast に戻すため、watchdog がそれを見ると
+    // 話し続けている最中に「結果が途絶えた」と誤判定し、文ごとにセッションを作り直してしまう。
+    private var lastRecognizerOutputTime = Date.distantPast
+    // 静寂（stallSpeechRecency 超）のあと発話が再開した時刻。
+    private var speechResumedTime = Date.distantPast
     // 「音そのものが届いているか」を見るための時刻。append(audioBuffer:) で更新する。
     private var lastAudioBufferTime = Date.distantPast
-    private var captureStartTime = Date.distantPast
+    // タップを最後に組んだ（作り直した）時刻。起動直後・作り直し直後の猶予の起点。
+    private var captureBuildTime = Date.distantPast
+    // 最後にデジタル無音でないバッファを受け取った時刻。
+    private var lastNonSilentAudioTime = Date.distantPast
     // デジタル無音（タップに中身が無い）と、実音声が一度でも入ったかを区別する。
     private var hasEverReceivedNonSilentAudio = false
+    // タップ対象のいずれかのプロセスが音を出しているか。マイクでは常に true。
+    private var sourceIsRenderingAudio = true
+    // 実音声なしで続いた captureSilent 起因の作り直し回数（権限不足の判定に使う）。
+    private var consecutiveSilentRebuilds = 0
+    private var permissionProblemReported = false
+    private var isRebuildingCapture = false
+    private var lastPublishedHealthStatus: CaptureHealthStatus?
+    private var lastMeterPublishTime = Date.distantPast
+    // アプリ音声のときだけ設定する。watchdog がプロセス集合を解決し直すのに使う。
+    private var activeApplicationSource: InputSource?
+    private var activeApplicationCaptureDescriptor: ApplicationCaptureDescriptor?
     private var watchdogTimer: DispatchSourceTimer?
-    // 書き込みは start() で一度きり（watchdog を captureQueue に積む前）。以後は checkForStall()
-    // が captureQueue 上で読むのみ。teardown で nil する場合は cancelWatchdog() 内（＝ captureQueue）で。
+    // 書き込みは start() で一度きり（watchdog を captureQueue に積む前）。以後は captureQueue 上で読むのみ。
     private var stallHandler: (@MainActor (CaptureHealthVerdict) -> Void)?
-    private let stallResultTimeout: TimeInterval = 10
-    private let stallSpeechRecency: TimeInterval = 3
+    private var healthHandler: (@MainActor (CaptureHealthStatus) -> Void)?
+    private var levelHandler: (@MainActor (Float) -> Void)?
+    private let healthTiming = CaptureHealth.Timing()
     private let watchdogInterval: TimeInterval = 2
-    /// バッファが完全に途絶えてから異常とみなすまで。出力デバイスの切り替えは数秒で復帰させたい。
-    private let audioStarvationTimeout: TimeInterval = 6
-    /// 一度も実音声が入らないまま経過したら異常とみなすまで。開始直後にアプリが無音なのは
-    /// 正常なので、`audioStarvationTimeout` より長く取る。
-    private let silentCaptureTimeout: TimeInterval = 25
+    private let meterPublishInterval: TimeInterval = 0.1
     /// これ以下のピークはデジタル無音（タップに中身が無い）とみなす。
     private let digitalSilencePeak: Float = 0.0005
 
@@ -330,7 +294,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
         errorHandler: @escaping @MainActor (String) -> Void,
         fatalErrorHandler: @escaping @MainActor (String) -> Void,
-        onStall: (@MainActor (CaptureHealthVerdict) -> Void)? = nil
+        onStall: (@MainActor (CaptureHealthVerdict) -> Void)? = nil,
+        onHealthChange: (@MainActor (CaptureHealthStatus) -> Void)? = nil,
+        onAudioLevel: (@MainActor (Float) -> Void)? = nil
     ) async throws {
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
@@ -341,6 +307,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         self.errorHandler = errorHandler
         self.fatalErrorHandler = fatalErrorHandler
         self.stallHandler = onStall
+        self.healthHandler = onHealthChange
+        self.levelHandler = onAudioLevel
         await MainActor.run {
             recentCommittedSentenceHistory.removeAll()
         }
@@ -358,10 +326,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 try self.startMicrophoneCapture(deviceUniqueID: source.detail)
             }
         case .application:
+            Logger.capture.notice("System Audio Recording preflight: \(String(describing: AudioCapturePermission.preflight()), privacy: .public)")
             let captureDescriptor = try await MainActor.run {
                 try self.makeApplicationCaptureDescriptor(for: source)
             }
             try await runOnCaptureQueue {
+                self.activeApplicationSource = source
+                self.activeApplicationCaptureDescriptor = captureDescriptor
                 try self.startApplicationAudioCapture(descriptor: captureDescriptor)
             }
         }
@@ -371,23 +342,30 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
-    // MARK: - Stall watchdog
+    // MARK: - Capture health watchdog
 
-    /// captureQueue で回す監視タイマー。開始時に lastRecognitionResultTime を「今」に置き直し、
-    /// 最初の結果までの猶予（stallResultTimeout）を与える。
+    /// captureQueue で回す監視タイマー。開始時に各時刻を「今」に置き直し、最初の結果・最初の
+    /// 音声までの猶予を与える。
     private func startWatchdog() {
         cancelWatchdog()
         let now = Date()
-        lastRecognitionResultTime = now
+        lastRecognizerOutputTime = now
         lastSpeechActivityTime = Date.distantPast
-        // 開始時刻とバッファ時刻を「今」に置くことで、起動直後に誤検出しない猶予を作る。
-        captureStartTime = now
+        speechResumedTime = Date.distantPast
+        captureBuildTime = now
         lastAudioBufferTime = now
+        lastNonSilentAudioTime = Date.distantPast
         hasEverReceivedNonSilentAudio = false
+        sourceIsRenderingAudio = activeApplicationSource == nil
+        consecutiveSilentRebuilds = 0
+        permissionProblemReported = false
+        isRebuildingCapture = false
+        lastPublishedHealthStatus = nil
+        publishHealthStatus(.starting)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now() + watchdogInterval, repeating: watchdogInterval)
         timer.setEventHandler { [weak self] in
-            self?.checkForStall()
+            self?.watchdogTick()
         }
         watchdogTimer = timer
         timer.resume()
@@ -398,32 +376,158 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         watchdogTimer = nil
     }
 
-    /// 発話は最近あった（stallSpeechRecency 以内）のに、結果が stallResultTimeout を超えて
-    /// 途絶えているなら「詰まり」。一度検出したら自分を止め、所有者へ通知する（重複通知を防ぐ）。
-    private func checkForStall() {
-        let verdict = Self.captureHealthVerdict(
-            now: Date(),
-            captureStartTime: captureStartTime,
-            lastAudioBufferTime: lastAudioBufferTime,
-            lastRecognitionResultTime: lastRecognitionResultTime,
-            lastSpeechActivityTime: lastSpeechActivityTime,
-            hasEverReceivedNonSilentAudio: hasEverReceivedNonSilentAudio,
-            audioStarvationTimeout: audioStarvationTimeout,
-            silentCaptureTimeout: silentCaptureTimeout,
-            resultTimeout: stallResultTimeout,
-            speechRecency: stallSpeechRecency
-        )
-
-        guard verdict != .healthy else {
+    /// アプリ音声なら、まずタップ対象のプロセス集合を解決し直す（NSWorkspace を使うので main で）。
+    /// 開始時に解決した集合は古くなり得る：Chrome の AudioService が再起動した、Safari が新しい
+    /// WebKit.GPU プロセスを立てた、開始時にはまだ音声オブジェクトを持たないヘルパーがあった、等。
+    private func watchdogTick() {
+        guard let source = activeApplicationSource else {
+            evaluateCaptureHealth(processSnapshot: nil)
             return
         }
 
-        cancelWatchdog()
-        guard let stallHandler else {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let snapshot = try? self.resolveApplicationProcesses(for: source)
+            self.captureQueue.async { [weak self] in
+                // stop() と競合した場合（watchdog 取り消し済み）は何もしない。
+                guard let self, self.watchdogTimer != nil else { return }
+                self.evaluateCaptureHealth(processSnapshot: snapshot)
+            }
+        }
+    }
+
+    private func evaluateCaptureHealth(processSnapshot: [ApplicationProcessCandidate]?) {
+        let now = Date()
+
+        if let processSnapshot, processSnapshot.isEmpty == false {
+            sourceIsRenderingAudio = processSnapshot.contains(where: \.isRunningOutput)
+            let resolvedIDs = processSnapshot.map(\.objectID)
+            if let descriptor = activeApplicationCaptureDescriptor,
+               Set(resolvedIDs) != Set(descriptor.processObjectIDs) {
+                Logger.capture.notice(
+                    "Tapped process set changed (\(descriptor.processObjectIDs.count, privacy: .public) -> \(resolvedIDs.count, privacy: .public)); rebuilding capture"
+                )
+                rebuildApplicationCapture(processObjectIDs: resolvedIDs, countsAsSilentRebuild: false)
+            }
+        }
+
+        if now.timeIntervalSince(lastAudioBufferTime) > 1 {
+            publishAudioLevel(0, force: true)
+        }
+
+        let verdict = CaptureHealth.verdict(
+            now: now,
+            captureBuildTime: captureBuildTime,
+            lastAudioBufferTime: lastAudioBufferTime,
+            lastNonSilentAudioTime: lastNonSilentAudioTime,
+            lastRecognitionResultTime: lastRecognizerOutputTime,
+            lastSpeechActivityTime: lastSpeechActivityTime,
+            speechResumedTime: speechResumedTime,
+            sourceIsRenderingAudio: sourceIsRenderingAudio,
+            timing: healthTiming
+        )
+        let action = CaptureHealth.recoveryAction(
+            for: verdict,
+            canRebuildCaptureInPlace: activeApplicationSource != nil,
+            hasEverReceivedNonSilentAudio: hasEverReceivedNonSilentAudio,
+            consecutiveSilentRebuilds: consecutiveSilentRebuilds,
+            permissionProblemReported: permissionProblemReported,
+            permission: verdict == .captureSilent ? AudioCapturePermission.preflight() : .unknown
+        )
+
+        switch action {
+        case .none:
+            break
+        case .rebuildCapture:
+            Logger.capture.warning("Capture unhealthy (\(String(describing: verdict), privacy: .public)); rebuilding tap")
+            let ids = processSnapshot?.map(\.objectID) ?? activeApplicationCaptureDescriptor?.processObjectIDs ?? []
+            rebuildApplicationCapture(
+                processObjectIDs: ids,
+                countsAsSilentRebuild: verdict == .captureSilent
+            )
+        case .reportPermissionProblem:
+            Logger.capture.error("Capture stays silent while the source is playing; System Audio Recording permission is likely missing")
+            permissionProblemReported = true
+        case .restartSession:
+            // ASR の詰まり。一度通知したら自分を止め、所有者がセッションを作り直す。
+            cancelWatchdog()
+            if let stallHandler {
+                Task { @MainActor in
+                    stallHandler(verdict)
+                }
+            }
+            return
+        }
+
+        publishHealthStatus(
+            CaptureHealth.status(
+                for: verdict,
+                hasEverReceivedNonSilentAudio: hasEverReceivedNonSilentAudio,
+                permissionProblemReported: permissionProblemReported,
+                isRebuilding: action == .rebuildCapture
+            )
+        )
+    }
+
+    /// タップと集約デバイスだけを作り直す。認識器・VAD・下書き状態はそのまま残すので、
+    /// 字幕の流れを切らずに音の経路だけを復旧できる。
+    private func rebuildApplicationCapture(processObjectIDs: [AudioObjectID], countsAsSilentRebuild: Bool) {
+        guard let descriptor = activeApplicationCaptureDescriptor, processObjectIDs.isEmpty == false else {
+            return
+        }
+
+        isRebuildingCapture = true
+        defer { isRebuildingCapture = false }
+
+        applicationAudioCapture?.stop()
+        applicationAudioCapture = nil
+
+        let rebuiltDescriptor = ApplicationCaptureDescriptor(
+            appName: descriptor.appName,
+            processObjectIDs: processObjectIDs,
+            readStreamFailureMessage: descriptor.readStreamFailureMessage
+        )
+        activeApplicationCaptureDescriptor = rebuiltDescriptor
+
+        let now = Date()
+        captureBuildTime = now
+        lastAudioBufferTime = now
+        if countsAsSilentRebuild {
+            consecutiveSilentRebuilds += 1
+        }
+
+        do {
+            try startApplicationAudioCapture(descriptor: rebuiltDescriptor)
+        } catch {
+            // 次の tick で audioStarved として再試行される。
+            Logger.capture.error("Capture rebuild failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func publishHealthStatus(_ status: CaptureHealthStatus) {
+        guard status != lastPublishedHealthStatus else {
+            return
+        }
+        lastPublishedHealthStatus = status
+        guard let healthHandler else {
             return
         }
         Task { @MainActor in
-            stallHandler(verdict)
+            healthHandler(status)
+        }
+    }
+
+    private func publishAudioLevel(_ level: Float, force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastMeterPublishTime) >= meterPublishInterval else {
+            return
+        }
+        lastMeterPublishTime = now
+        guard let levelHandler else {
+            return
+        }
+        Task { @MainActor in
+            levelHandler(level)
         }
     }
 
@@ -456,6 +560,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         applicationAudioCapture?.stop()
         applicationAudioCapture = nil
+        activeApplicationSource = nil
+        activeApplicationCaptureDescriptor = nil
 
         stopModernSpeechRecognizer()
         resetRecognitionFailureState()
@@ -879,15 +985,25 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private func resolveApplicationProcessObjectIDs(for source: InputSource) throws -> [AudioObjectID] {
+        try resolveApplicationProcesses(for: source).map(\.objectID)
+    }
+
+    /// タップ対象になるプロセス（本体＋ヘルパー）を Core Audio のプロセス一覧から集める。
+    /// ブラウザは本体プロセスから音を出さない（Chrome は AudioService ヘルパー、Safari は
+    /// com.apple.WebKit.GPU）ので、ヘルパーを含めないと無音になる。
+    private func resolveApplicationProcesses(for source: InputSource) throws -> [ApplicationProcessCandidate] {
         let runningApp = try resolveRunningApplication(for: source)
         let system = AudioHardwareSystem.shared
         let audioProcesses = try system.processes
         let targetAssociation = ApplicationProcessAssociation(runningApplication: runningApp)
-        var relatedProcessIDs: [AudioObjectID] = []
+        var candidates: [ApplicationProcessCandidate] = []
         var seen = Set<AudioObjectID>()
 
         for process in audioProcesses {
-            let processID = try process.pid
+            guard let processID = try? process.pid else {
+                // 列挙中に終了したプロセス。
+                continue
+            }
             let processObjectID = process.id
             let processBundleIdentifier = (try? process.bundleID) ?? ""
             let processAppBundleURL = applicationBundleURL(forProcessID: processID)
@@ -908,19 +1024,41 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 }
 
             if seen.insert(processObjectID).inserted {
-                relatedProcessIDs.append(processObjectID)
+                candidates.append(
+                    ApplicationProcessCandidate(
+                        objectID: processObjectID,
+                        isRunningOutput: Self.processIsRunningOutput(processObjectID)
+                    )
+                )
             }
         }
 
-        if relatedProcessIDs.isEmpty {
+        if candidates.isEmpty {
             if let exactProcess = try system.process(for: runningApp.processIdentifier) {
-                return [exactProcess.id]
+                return [
+                    ApplicationProcessCandidate(
+                        objectID: exactProcess.id,
+                        isRunningOutput: Self.processIsRunningOutput(exactProcess.id)
+                    )
+                ]
             }
 
             throw SessionError.applicationNotProducingAudio(source.name)
         }
 
-        return relatedProcessIDs
+        return candidates
+    }
+
+    private static func processIsRunningOutput(_ processObjectID: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningOutput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(processObjectID, &address, 0, nil, &size, &value)
+        return status == noErr && value != 0
     }
 
     private func resolveRunningApplication(for source: InputSource) throws -> NSRunningApplication {
@@ -993,8 +1131,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
         if audioLevels.peak > digitalSilencePeak {
+            lastNonSilentAudioTime = Date()
             hasEverReceivedNonSilentAudio = true
+            consecutiveSilentRebuilds = 0
+            if permissionProblemReported {
+                // 音が来た＝権限はある（ユーザーが設定で許可した等）。表示を戻す。
+                permissionProblemReported = false
+                publishHealthStatus(.hearingAudio)
+            }
         }
+        publishAudioLevel(CaptureHealth.meterLevel(rms: audioLevels.rms))
         boostIfQuiet(buffer: processingBuffer, levels: audioLevels)
 
         if let vadEngine {
@@ -1003,7 +1149,11 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
             // 詰まり検出用：発話が来ていることを記録する（結果が途絶えても音は来ている、を判定するため）。
             if vadResult.speechProbability > 0.5 {
-                lastSpeechActivityTime = Date()
+                let now = Date()
+                if now.timeIntervalSince(lastSpeechActivityTime) > healthTiming.speechRecency {
+                    speechResumedTime = now
+                }
+                lastSpeechActivityTime = now
             }
 
             if vadResult.containsSpeechOffset {
@@ -1716,6 +1866,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func processRecognitionResult(_ result: SFSpeechRecognitionResult) {
         lastRecognitionResultTime = Date()
+        lastRecognizerOutputTime = lastRecognitionResultTime
         // The recognizer is delivering again — forget any earlier failures.
         consecutiveRecognitionFailures = 0
         let transcription = result.bestTranscription
@@ -2004,6 +2155,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func processModernRecognitionResult(_ result: SpeechTranscriber.Result) {
         let now = Date()
         lastRecognitionResultTime = now
+        lastRecognizerOutputTime = now
         let fullText = normalizedTranscriberText(result.text)
         let pendingRawText = pendingModernText(from: fullText)
         let text = pendingRawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2703,33 +2855,27 @@ private final class ApplicationAudioCapture {
 
             self.processTap = processTap
 
-            guard let outputDevice = try system.defaultOutputDevice else {
-                throw CaptureError.missingOutputDevice
-            }
-
-            let outputUID = try outputDevice.uid
-            let aggregateDescription: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "v2s-\(appName)",
-                kAudioAggregateDeviceUIDKey: UUID().uuidString,
-                kAudioAggregateDeviceMainSubDeviceKey: outputUID,
-                kAudioAggregateDeviceIsPrivateKey: true,
-                kAudioAggregateDeviceIsStackedKey: false,
-                kAudioAggregateDeviceTapAutoStartKey: true,
-                kAudioAggregateDeviceSubDeviceListKey: [
-                    [
-                        kAudioSubDeviceUIDKey: outputUID
-                    ]
-                ],
-                kAudioAggregateDeviceTapListKey: [
-                    [
-                        kAudioSubTapDriftCompensationKey: true,
-                        kAudioSubTapUIDKey: try processTap.uid
-                    ]
-                ]
-            ]
-
-            guard let aggregateDevice = try system.makeAggregateDevice(description: aggregateDescription) else {
-                throw CaptureError.failed(stage: "create the aggregate device", status: kAudioHardwareIllegalOperationError)
+            // まず出力デバイスを sub-device に持たない「タップだけ」の集約デバイスで組む。
+            // 出力デバイスを main sub-device に固定すると、Bluetooth ヘッドセットの接続・切断や
+            // 会議がマイクを開いた時の A2DP→HFP 切り替えで sub-device が古くなり、IOProc が
+            // 止まる（エラーは出ない）。タップだけでも IOProc が回ることは実機で確認済み。
+            // 念のため、組めない環境では従来どおり既定の出力デバイスを clock にして組み直す。
+            let tapUID = try processTap.uid
+            let aggregateDevice: AudioHardwareAggregateDevice
+            if let tapOnlyDevice = try? system.makeAggregateDevice(
+                description: Self.aggregateDescription(appName: appName, tapUID: tapUID, outputUID: nil)
+            ) {
+                aggregateDevice = tapOnlyDevice
+            } else {
+                guard let outputDevice = try system.defaultOutputDevice else {
+                    throw CaptureError.missingOutputDevice
+                }
+                guard let clockedDevice = try system.makeAggregateDevice(
+                    description: Self.aggregateDescription(appName: appName, tapUID: tapUID, outputUID: try outputDevice.uid)
+                ) else {
+                    throw CaptureError.failed(stage: "create the aggregate device", status: kAudioHardwareIllegalOperationError)
+                }
+                aggregateDevice = clockedDevice
             }
 
             self.aggregateDevice = aggregateDevice
@@ -2740,6 +2886,7 @@ private final class ApplicationAudioCapture {
             }
 
             self.tapFormat = tapFormat
+            installTapFormatListener(tapID: processTap.id)
 
             var deviceIOProcID: AudioDeviceIOProcID?
             let createIOProcStatus = AudioDeviceCreateIOProcIDWithBlock(
@@ -2792,12 +2939,76 @@ private final class ApplicationAudioCapture {
 
         aggregateDevice = nil
 
+        removeTapFormatListener()
+
         if let processTap {
             try? system.destroyProcessTap(processTap)
         }
 
         processTap = nil
         tapFormat = nil
+    }
+
+    private static func aggregateDescription(appName: String, tapUID: String, outputUID: String?) -> [String: Any] {
+        var description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "v2s-\(appName)",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceTapListKey: [
+                [
+                    kAudioSubTapDriftCompensationKey: true,
+                    kAudioSubTapUIDKey: tapUID
+                ]
+            ]
+        ]
+        if let outputUID {
+            description[kAudioAggregateDeviceMainSubDeviceKey] = outputUID
+            description[kAudioAggregateDeviceSubDeviceListKey] = [
+                [
+                    kAudioSubDeviceUIDKey: outputUID
+                ]
+            ]
+        }
+        return description
+    }
+
+    private var tapFormatListener: (tapID: AudioObjectID, block: AudioObjectPropertyListenerBlock)?
+
+    private static var tapFormatAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    /// 出力先のサンプルレートが変わる（Bluetooth の HFP 切り替えで 48 kHz→16/24 kHz 等）と
+    /// タップの形式も変わる。開始時の形式のままバッファを包むと、再生速度のずれた音が認識器に
+    /// 渡ってしまうので、変更を購読して包む形式を差し替える。
+    private func installTapFormatListener(tapID: AudioObjectID) {
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, let processTap = self.processTap,
+                  var streamDescription = try? processTap.format,
+                  let newFormat = AVAudioFormat(streamDescription: &streamDescription) else {
+                return
+            }
+            self.tapFormat = newFormat
+        }
+        var address = Self.tapFormatAddress
+        if AudioObjectAddPropertyListenerBlock(tapID, &address, queue, block) == noErr {
+            tapFormatListener = (tapID, block)
+        }
+    }
+
+    private func removeTapFormatListener() {
+        guard let tapFormatListener else {
+            return
+        }
+        var address = Self.tapFormatAddress
+        AudioObjectRemovePropertyListenerBlock(tapFormatListener.tapID, &address, queue, tapFormatListener.block)
+        self.tapFormatListener = nil
     }
 
     private func handleCapturedAudio(_ inputData: UnsafePointer<AudioBufferList>) {

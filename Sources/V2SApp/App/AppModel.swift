@@ -78,6 +78,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessionState: SessionState = .idle
     /// 詰まりを検出して自動再接続している最中か。UI（メニューバーアイコン等）の表示に使う。
     @Published private(set) var isReconnecting = false
+    /// キャプチャ経路の状態（音が聞こえているか・権限が怪しいか等）。セッション外では nil。
+    @Published private(set) var captureHealthStatus: CaptureHealthStatus?
+    /// 0...1 の入力レベル。ポップオーバーとオーバーレイのメーターに使う。
+    @Published private(set) var captureAudioLevel: Float = 0
+    private var captureHealthBySession: [ObjectIdentifier: CaptureHealthStatus] = [:]
+    private var captureLevelBySession: [ObjectIdentifier: Float] = [:]
+    /// 現在のセッション群の ID。停止後に遅れて届く古いセッションの通知を捨てるため。
+    private var activeCaptureSessionIDs = Set<ObjectIdentifier>()
     /// 自動再接続の連打を防ぐためのクールダウン基準時刻。
     private var lastStallRecoveryTime = Date.distantPast
     /// 再接続の startSession() が実行中か。async な再起動が自分自身と多重に走るのを防ぐ。
@@ -573,6 +581,7 @@ final class AppModel: ObservableObject {
     func startSession() async {
         // Finish releasing any earlier capture resources before opening replacements.
         await stopLiveTranscriptionSessionsAndWait()
+        resetCaptureHealth()
         refreshSources()
 
         let selectedSources = self.selectedSources
@@ -626,6 +635,7 @@ final class AppModel: ObservableObject {
             // Identity only. Capturing the session in the handler it is about to own
             // would retain it for the session's own lifetime.
             let sessionID = ObjectIdentifier(session)
+            activeCaptureSessionIDs.insert(sessionID)
 
             do {
                 try await session.start(
@@ -674,6 +684,12 @@ final class AppModel: ObservableObject {
                     },
                     onStall: { [weak self] verdict in
                         self?.handlePipelineStall(verdict)
+                    },
+                    onHealthChange: { [weak self] status in
+                        self?.updateCaptureHealth(status, sessionID: sessionID, sourceName: source.name)
+                    },
+                    onAudioLevel: { [weak self] level in
+                        self?.updateCaptureLevel(level, sessionID: sessionID)
                     }
                 )
 
@@ -793,6 +809,7 @@ final class AppModel: ObservableObject {
     func stopSession() {
         resetLiveTextPipeline()
         stopLiveTranscriptionSessions()
+        resetCaptureHealth()
         sessionState = .idle
         isReconnecting = false
         isRestartingAfterStall = false
@@ -830,13 +847,122 @@ final class AppModel: ObservableObject {
             Logger.session.warning("Capture silent (buffers arriving but no audio this session) — rebuilding capture")
         case .pipelineStalled:
             Logger.session.warning("Pipeline stalled (speech present, no ASR results) — restarting session")
-        case .healthy:
+        case .healthy, .sourceIdle:
             break
         }
 
         Task { [weak self] in
             await self?.startSession()
             self?.isRestartingAfterStall = false
+        }
+    }
+
+    // MARK: - Capture health
+
+    /// 複数ソースのときは「一番よい」状態を見せる。どれか 1 つでも聞こえていれば字幕は出るので、
+    /// 権限の警告で不安にさせない。どれも聞こえていないときに限り、対処が必要なものを優先する。
+    static func combinedCaptureHealth(_ statuses: [CaptureHealthStatus]) -> CaptureHealthStatus? {
+        let priority: [CaptureHealthStatus] = [
+            .hearingAudio,
+            .permissionProblemSuspected,
+            .reconnecting,
+            .waitingForSourceAudio,
+            .starting
+        ]
+        return priority.first(where: statuses.contains)
+    }
+
+    private func updateCaptureHealth(_ status: CaptureHealthStatus, sessionID: ObjectIdentifier, sourceName: String) {
+        guard activeCaptureSessionIDs.contains(sessionID) else {
+            return
+        }
+        captureHealthBySession[sessionID] = status
+        let combined = Self.combinedCaptureHealth(Array(captureHealthBySession.values))
+        guard combined != captureHealthStatus else {
+            return
+        }
+        captureHealthStatus = combined
+        refreshCapturePlaceholder(sourceName: sourceName)
+    }
+
+    private func updateCaptureLevel(_ level: Float, sessionID: ObjectIdentifier) {
+        guard activeCaptureSessionIDs.contains(sessionID) else {
+            return
+        }
+        captureLevelBySession[sessionID] = level
+        let combined = captureLevelBySession.values.max() ?? 0
+        // 描画負荷を抑えるため、見た目が変わらない微小な変化は流さない。
+        if abs(combined - captureAudioLevel) >= 0.02 || (combined == 0 && captureAudioLevel != 0) {
+            captureAudioLevel = combined
+        }
+    }
+
+    private func resetCaptureHealth() {
+        activeCaptureSessionIDs.removeAll()
+        captureHealthBySession.removeAll()
+        captureLevelBySession.removeAll()
+        captureHealthStatus = nil
+        captureAudioLevel = 0
+    }
+
+    /// まだ字幕が 1 つも出ていない（プレースホルダ表示中）なら、状態に合った案内に差し替える。
+    /// 「音声待ち」のまま固まって見えるのが一番分かりにくいので、何が起きているかを文字で出す。
+    private func refreshCapturePlaceholder(sourceName: String) {
+        guard let overlayState, overlayState.translatedText == listeningPlaceholderText,
+              let captureHealthStatus else {
+            return
+        }
+        let hint: String
+        switch captureHealthStatus {
+        case .starting, .hearingAudio:
+            hint = localized(.waitingForAudioFromFormat, overlayState.sourceName)
+        case .waitingForSourceAudio:
+            hint = localized(.captureWaitingForSourceAudioFormat, overlayState.sourceName)
+        case .reconnecting:
+            hint = localized(.captureReconnectingHint)
+        case .permissionProblemSuspected:
+            hint = localized(.capturePermissionProblemHintFormat, overlayState.sourceName)
+        }
+        guard hint != overlayState.sourceText else {
+            return
+        }
+        self.overlayState = OverlayPreviewState(
+            translatedText: listeningPlaceholderText,
+            sourceText: hint,
+            sourceName: overlayState.sourceName
+        )
+    }
+
+    var captureHealthText: String? {
+        guard let captureHealthStatus else {
+            return nil
+        }
+        switch captureHealthStatus {
+        case .starting:
+            return localized(.captureStatusStarting)
+        case .hearingAudio:
+            return localized(.captureStatusHearing)
+        case .waitingForSourceAudio:
+            return localized(.captureStatusWaiting)
+        case .reconnecting:
+            return localized(.captureStatusReconnecting)
+        case .permissionProblemSuspected:
+            return localized(.captureStatusPermission)
+        }
+    }
+
+    /// 「プライバシーとセキュリティ › 画面とシステムオーディオの録音」を開く。
+    /// 専用のペインが開けない OS では「プライバシーとセキュリティ」に落とす。
+    func openSystemAudioRecordingSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AudioCapture",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+            "x-apple.systempreferences:"
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) {
+                return
+            }
         }
     }
 

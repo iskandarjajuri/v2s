@@ -70,14 +70,22 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusIcon() }
             .store(in: &cancellables)
+        model.$captureHealthStatus
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
     }
 
     private func updateStatusIcon() {
         let symbolName: String
 
-        if model.isReconnecting {
+        if model.isReconnecting || model.captureHealthStatus == .reconnecting {
             // 詰まりを検出して自動再接続している最中であることを見せる。
             symbolName = "arrow.triangle.2.circlepath"
+        } else if model.captureHealthStatus == .permissionProblemSuspected {
+            // 会議中はポップオーバーを開かないので、メニューバーだけで「音が取れていない」と分かるように。
+            symbolName = "exclamationmark.bubble"
         } else {
             switch model.sessionState {
             case .idle:
