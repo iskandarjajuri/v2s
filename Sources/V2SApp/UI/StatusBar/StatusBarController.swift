@@ -29,7 +29,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         configureStatusItem()
         configurePopover()
         bindModel()
-        updateStatusIcon(for: model.sessionState)
+        updateStatusIcon()
     }
 
     private func configureStatusItem() {
@@ -60,23 +60,41 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     private func bindModel() {
+        // .receive(on:) で「値が格納された後」に配信させる（@Published は willSet で発火するため、
+        // sink 内で model を読むと更新前の値になる）。
         model.$sessionState
-            .sink { [weak self] state in
-                self?.updateStatusIcon(for: state)
-            }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
+        model.$isReconnecting
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
+        model.$captureHealthStatus
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
             .store(in: &cancellables)
     }
 
-    private func updateStatusIcon(for state: SessionState) {
+    private func updateStatusIcon() {
         let symbolName: String
 
-        switch state {
-        case .idle:
-            symbolName = "captions.bubble"
-        case .running:
-            symbolName = "captions.bubble.fill"
-        case .error:
+        if model.isReconnecting || model.captureHealthStatus == .reconnecting {
+            // 詰まりを検出して自動再接続している最中であることを見せる。
+            symbolName = "arrow.triangle.2.circlepath"
+        } else if model.captureHealthStatus == .permissionProblemSuspected {
+            // 会議中はポップオーバーを開かないので、メニューバーだけで「音が取れていない」と分かるように。
             symbolName = "exclamationmark.bubble"
+        } else {
+            switch model.sessionState {
+            case .idle:
+                symbolName = "captions.bubble"
+            case .running:
+                symbolName = "captions.bubble.fill"
+            case .error:
+                symbolName = "exclamationmark.bubble"
+            }
         }
 
         let image = NSImage(

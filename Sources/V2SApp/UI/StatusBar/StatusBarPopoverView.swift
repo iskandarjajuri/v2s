@@ -76,6 +76,16 @@ struct StatusBarPopoverView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(model.isSessionButtonDisabled)
+            if let status = model.captureHealthStatus {
+                CaptureHealthCard(
+                    status: status,
+                    text: model.captureHealthText ?? "",
+                    level: model.captureAudioLevel,
+                    label: model.localized(.audioInput),
+                    settingsTitle: model.localized(.openAudioRecordingSettings),
+                    openSettings: model.openSystemAudioRecordingSettings
+                )
+            }
         }
         .padding(16)
     }
@@ -323,5 +333,85 @@ struct VersionLink: View {
         Text(verbatim: versionText)
             .font(font)
             .foregroundStyle(.secondary)
+    }
+}
+
+/// 「いま音が聞こえているか」を一目で分かるようにするカード。字幕が出ない原因の大半は
+/// 「対象アプリが音を出していない」か「権限が無い」なので、その 2 つを言葉とメーターで区別する。
+private struct CaptureHealthCard: View {
+    let status: CaptureHealthStatus
+    let text: String
+    let level: Float
+    let label: String
+    let settingsTitle: String
+    let openSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: symbolName)
+                    .foregroundStyle(tint)
+                    .frame(width: 16)
+                Text(label)
+                    .font(.caption.weight(.medium))
+                AudioLevelMeter(level: level, tint: tint)
+                    .frame(height: 6)
+            }
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if status == .permissionProblemSuspected {
+                Button(settingsTitle, action: openSettings)
+                    .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(.fill.quaternary, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var symbolName: String {
+        switch status {
+        case .hearingAudio:
+            return "waveform"
+        case .starting, .waitingForSourceAudio:
+            return "speaker.wave.1"
+        case .reconnecting:
+            return "arrow.triangle.2.circlepath"
+        case .permissionProblemSuspected:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch status {
+        case .hearingAudio:
+            return .green
+        case .starting, .waitingForSourceAudio:
+            return .secondary
+        case .reconnecting:
+            return .orange
+        case .permissionProblemSuspected:
+            return .red
+        }
+    }
+}
+
+private struct AudioLevelMeter: View {
+    let level: Float
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule()
+                    .fill(tint)
+                    .frame(width: proxy.size.width * CGFloat(min(max(level, 0), 1)))
+            }
+        }
+        .animation(.linear(duration: 0.1), value: level)
+        .accessibilityHidden(true)
     }
 }

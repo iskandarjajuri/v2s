@@ -188,6 +188,12 @@ struct SettingsView: View {
                             .labelsHidden()
                     }
                     Divider()
+                    settingsRow("Show icon in Dock") {
+                        Toggle("", isOn: showInDockBinding)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                    }
+                    Divider()
                     settingsRow(model.localized(.checkForUpdatesAutomatically)) {
                         Toggle("", isOn: $updaterService.automaticallyChecksForUpdates)
                             .toggleStyle(.switch)
@@ -285,6 +291,11 @@ struct SettingsView: View {
                             .labelsHidden()
                     }
                     Divider()
+                    settingsRow(model.localized(.sourceSubtitleColor)) {
+                        ColorPicker("", selection: sourceSubtitleColorBinding, supportsOpacity: false)
+                            .labelsHidden()
+                    }
+                    Divider()
                     settingsRow(model.localized(.backgroundColor)) {
                         ColorPicker("", selection: backgroundColorBinding, supportsOpacity: false)
                             .labelsHidden()
@@ -295,6 +306,7 @@ struct SettingsView: View {
                             Button {
                                 model.updateOverlayStyle { style in
                                     style.subtitleColor = .defaultSubtitle
+                                    style.sourceSubtitleColor = .defaultSourceSubtitle
                                     style.backgroundColor = .defaultBackground
                                 }
                             } label: {
@@ -452,6 +464,17 @@ struct SettingsView: View {
         )
     }
 
+    private var sourceSubtitleColorBinding: Binding<Color> {
+        Binding(
+            get: { model.overlayStyle.sourceSubtitleColor.color },
+            set: { newColor in
+                model.updateOverlayStyle { style in
+                    style.sourceSubtitleColor = OverlayColor(color: newColor)
+                }
+            }
+        )
+    }
+
     private var backgroundColorBinding: Binding<Color> {
         Binding(
             get: { model.overlayStyle.backgroundColor.color },
@@ -476,6 +499,10 @@ struct SettingsView: View {
                 }
             }
         )
+    }
+
+    private var showInDockBinding: Binding<Bool> {
+        Binding(get: { model.showInDock }, set: { model.showInDock = $0 })
     }
 
     private var attachToSourceBinding: Binding<Bool> {
@@ -548,6 +575,7 @@ struct SettingsView: View {
 
     private var colorsUseDefaultValues: Bool {
         model.overlayStyle.subtitleColor == .defaultSubtitle
+            && model.overlayStyle.sourceSubtitleColor == .defaultSourceSubtitle
             && model.overlayStyle.backgroundColor == .defaultBackground
     }
 

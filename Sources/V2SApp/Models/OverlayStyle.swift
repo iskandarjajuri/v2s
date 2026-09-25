@@ -14,6 +14,14 @@ struct OverlayColor: Codable, Equatable {
         blue: 1.0,
         alpha: 1.0
     )
+    /// 原文（ソース）行の既定色。翻訳行の白に対して十分なコントラスト差を持ちつつ、
+    /// 暗い背景でも視認性を保てる淡いシアン。
+    static let defaultSourceSubtitle = OverlayColor(
+        red: 0.62,
+        green: 0.86,
+        blue: 1.0,
+        alpha: 1.0
+    )
     static let defaultBackground = OverlayColor(
         red: 0.0,
         green: 0.0,
@@ -70,6 +78,7 @@ struct OverlayStyle: Codable, Equatable {
         case maxWidth
         case backgroundOpacity
         case subtitleColor
+        case sourceSubtitleColor
         case backgroundColor
         case showsTextOutline = "usesWhiteTextOutline"
         case textOutlineColor
@@ -92,7 +101,10 @@ struct OverlayStyle: Codable, Equatable {
     var minWidth: Double
     var maxWidth: Double
     var backgroundOpacity: Double
+    /// 翻訳行の色。
     var subtitleColor: OverlayColor
+    /// 原文行の色。翻訳と原文を一目で区別するため別々に持つ。
+    var sourceSubtitleColor: OverlayColor
     var backgroundColor: OverlayColor
     var showsTextOutline: Bool
     var textOutlineColor: OverlayColor
@@ -118,6 +130,7 @@ struct OverlayStyle: Codable, Equatable {
         maxWidth: 1440,
         backgroundOpacity: 0.32,
         subtitleColor: .defaultSubtitle,
+        sourceSubtitleColor: .defaultSourceSubtitle,
         backgroundColor: .defaultBackground,
         showsTextOutline: false,
         textOutlineColor: .defaultTextOutline,
@@ -138,6 +151,7 @@ struct OverlayStyle: Codable, Equatable {
         maxWidth: Double,
         backgroundOpacity: Double,
         subtitleColor: OverlayColor,
+        sourceSubtitleColor: OverlayColor = .defaultSourceSubtitle,
         backgroundColor: OverlayColor,
         showsTextOutline: Bool,
         textOutlineColor: OverlayColor,
@@ -156,6 +170,7 @@ struct OverlayStyle: Codable, Equatable {
         self.maxWidth = maxWidth
         self.backgroundOpacity = backgroundOpacity
         self.subtitleColor = subtitleColor
+        self.sourceSubtitleColor = sourceSubtitleColor
         self.backgroundColor = backgroundColor
         self.showsTextOutline = showsTextOutline
         self.textOutlineColor = textOutlineColor
@@ -179,6 +194,8 @@ struct OverlayStyle: Codable, Equatable {
         backgroundOpacity  = try c.decode(Double.self, forKey: .backgroundOpacity)
         subtitleColor      = try c.decodeIfPresent(OverlayColor.self, forKey: .subtitleColor)
             ?? .defaultSubtitle
+        sourceSubtitleColor = try c.decodeIfPresent(OverlayColor.self, forKey: .sourceSubtitleColor)
+            ?? .defaultSourceSubtitle
         backgroundColor    = try c.decodeIfPresent(OverlayColor.self, forKey: .backgroundColor)
             ?? .defaultBackground
         let legacyWhiteOutline = try legacy.decodeIfPresent(Bool.self, forKey: .usesHighContrastBorder)

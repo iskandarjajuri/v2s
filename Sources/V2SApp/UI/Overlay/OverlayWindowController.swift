@@ -7,6 +7,7 @@ import SwiftUI
 final class OverlayWindowController {
     private let model: AppModel
     private let showTranscript: () -> Void
+    private let openControls: () -> Void
     private let interactionState = OverlayInteractionState()
     private let panel: OverlayPanel
     private let controlsChromePanel: OverlayPanel
@@ -64,9 +65,10 @@ final class OverlayWindowController {
         }
     }
 
-    init(model: AppModel, showTranscript: @escaping () -> Void) {
+    init(model: AppModel, showTranscript: @escaping () -> Void, openControls: @escaping () -> Void) {
         self.model = model
         self.showTranscript = showTranscript
+        self.openControls = openControls
         self.panel = OverlayPanel(
             contentRect: NSRect(x: 0, y: 0, width: 1024, height: 120),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -157,7 +159,8 @@ final class OverlayWindowController {
         scrollbarHostingView.rootView = OverlayHistoryScrollbarView(
             model: model,
             interactionState: interactionState,
-            showTranscript: showTranscript
+            showTranscript: showTranscript,
+            openControls: openControls
         )
         bindModel()
         syncWindow()

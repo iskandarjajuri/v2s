@@ -149,7 +149,7 @@ struct OverlayView: View {
                 translated: state.translatedText,
                 translatedColor: baseSubtitleColor,
                 source: state.sourceText,
-                sourceColor: subtitleColor(opacity: 0.82)
+                sourceColor: sourceSubtitleColor(opacity: 0.82)
             )
             .background(committedSlotHeightReader),
             key: promotionKey(
@@ -202,7 +202,7 @@ struct OverlayView: View {
                             if let draftTranslated = visibleDraftTranslatedText {
                                 translatedText(
                                     draftTranslated,
-                                    color: subtitleColor(opacity: 0.55)
+                                    color: sourceSubtitleColor(opacity: 0.55)
                                 )
                             } else if model.shouldReserveDraftTranslationSlot {
                                 Text(" ")
@@ -265,7 +265,7 @@ struct OverlayView: View {
             translated: entry.translatedText,
             translatedColor: subtitleColor(opacity: translatedOpacity),
             source: entry.sourceText,
-            sourceColor: subtitleColor(opacity: sourceOpacity)
+            sourceColor: sourceSubtitleColor(opacity: sourceOpacity)
         )
         .background(historyEntryHeightReader(for: entry.id))
     }
@@ -637,13 +637,13 @@ struct OverlayView: View {
 
         if stable.isEmpty == false {
             var stablePart = AttributedString(stable)
-            stablePart.foregroundColor = subtitleColor(opacity: 0.62)
+            stablePart.foregroundColor = sourceSubtitleColor(opacity: 0.62)
             attributed += stablePart
         }
 
         if mutable.isEmpty == false {
             var mutablePart = AttributedString(mutable)
-            mutablePart.foregroundColor = subtitleColor(opacity: 0.48)
+            mutablePart.foregroundColor = sourceSubtitleColor(opacity: 0.48)
             attributed += mutablePart
         }
 
@@ -682,8 +682,18 @@ struct OverlayView: View {
         model.overlayStyle.textOutlineColor.color
     }
 
+    private var baseSourceSubtitleColor: Color {
+        model.overlayStyle.sourceSubtitleColor.color
+    }
+
     private func subtitleColor(opacity: Double) -> Color {
         baseSubtitleColor.opacity(opacity)
+    }
+
+    /// 原文行の色。翻訳行（`subtitleColor`）と別系統にすることで、
+    /// どちらが原文でどちらが訳文かを色だけで判別できるようにする。
+    private func sourceSubtitleColor(opacity: Double) -> Color {
+        baseSourceSubtitleColor.opacity(opacity)
     }
 
     @ViewBuilder
@@ -933,14 +943,19 @@ struct OverlayHistoryScrollbarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var interactionState: OverlayInteractionState
     var showTranscript: () -> Void = {}
+    // オーバーレイからメインの操作画面（Settings）へ戻る導線。menu-bar アイコンを探せない人向け。
+    var openControls: () -> Void = {}
 
     var body: some View {
         let revealProgress = interactionState.scrollbarRevealProgress
         let latestButtonRevealProgress = latestButtonRevealProgress(for: revealProgress)
 
         VStack(spacing: 0) {
-            transcriptButton(revealProgress: revealProgress)
+            controlsButton(revealProgress: revealProgress)
                 .padding(.top, OverlayHistoryScrollbarLayout.verticalPadding)
+                .padding(.bottom, OverlayHistoryScrollbarLayout.buttonSpacing)
+
+            transcriptButton(revealProgress: revealProgress)
                 .padding(.bottom, OverlayHistoryScrollbarLayout.buttonSpacing)
 
             GeometryReader { proxy in
@@ -1081,6 +1096,26 @@ struct OverlayHistoryScrollbarView: View {
         .allowsHitTesting(revealProgress > 0.05)
         .animation(.easeOut(duration: 0.16), value: revealProgress)
         .accessibilityLabel(model.localized(.transcript))
+    }
+
+    private func controlsButton(revealProgress: CGFloat) -> some View {
+        Button {
+            openControls()
+        } label: {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12))
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: OverlayControlsLayout.controlSize, height: OverlayControlsLayout.controlSize)
+        .opacity(revealProgress)
+        .scaleEffect(0.9 + (0.1 * revealProgress))
+        .allowsHitTesting(revealProgress > 0.05)
+        .animation(.easeOut(duration: 0.16), value: revealProgress)
+        .accessibilityLabel("Open controls")
     }
 }
 
