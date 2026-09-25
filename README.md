@@ -121,6 +121,46 @@ To build specifically for an Intel Mac:
 swift build -c release --arch x86_64
 ```
 
+### Building for daily use (keeps the audio permission)
+
+```bash
+scripts/run-local.sh
+```
+
+This builds v2s, signs it with your **Apple Development** certificate, installs it to
+`~/Applications`, and launches it with `open`. Use it instead of running from Xcode when you
+want app audio capture to keep working across rebuilds:
+
+- Debug builds from the project are signed ad hoc. macOS ties the *Screen & System Audio
+  Recording* permission to the app's code signature, and an ad-hoc signature changes on every
+  rebuild, so the old permission stops applying. Core Audio then delivers pure silence without
+  reporting an error.
+- An app started from Xcode (⌘R) or a terminal is checked against **Xcode's/Terminal's**
+  permission, not v2s's. `open` makes v2s responsible for its own permission.
+
+Run the tests with:
+
+```bash
+xcodebuild test -workspace .swiftpm/xcode/package.xcworkspace -scheme v2s \
+  -destination 'platform=macOS' COREML_CODEGEN_LANGUAGE=Swift
+```
+
+## Troubleshooting: no subtitles from Google Meet / a browser
+
+Open the menu bar popover while the session runs. The **Audio** card shows a live level meter
+and what v2s hears:
+
+| Status | Meaning | What to do |
+| --- | --- | --- |
+| Hearing audio | Audio arrives | — |
+| Connected — app is silent | The app is not playing sound yet (e.g. Meet lobby) | Join the meeting or unmute the speaker. v2s keeps waiting; it no longer restarts itself in a loop. |
+| Reconnecting audio… | The audio route changed (Bluetooth headset, browser audio process restarted) | Nothing; v2s rebuilds only the audio tap and keeps the recognizer running. |
+| No audio — check permission | The app is playing but v2s only receives silence | Click **Open Audio Recording Settings**, enable v2s under *System Audio Recording Only*, then restart v2s. If you rebuilt v2s, use `scripts/run-local.sh`. |
+
+Bluetooth headsets: capture no longer uses the output device as its clock, so switching a
+headset between music (A2DP) and call (HFP) mode, or connecting it mid-meeting, does not stop
+capture.
+
 ## License
 
 MIT
