@@ -68,4 +68,8 @@ cat <<'EOF'
 If subtitles show "No audio — check permission", open
 System Settings > Privacy & Security > Screen & System Audio Recording,
 enable v2s under "System Audio Recording Only", then quit and reopen v2s.
+
+Note: turn off "Check for Updates Automatically" in v2s Settings for this local build.
+Otherwise Sparkle replaces it with the next upstream release, which is signed differently
+and does not contain your local changes.
 EOF
