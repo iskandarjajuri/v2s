@@ -237,6 +237,18 @@ final class CaptureHealthStatusTests: XCTestCase {
         )
     }
 
+    /// 静かなロビー（権限あり・作り直し済み）で「再接続中」に張り付かないこと。
+    func testSilentButRenderingSourceShowsWaitingNotReconnecting() {
+        XCTAssertEqual(
+            CaptureHealth.status(for: .captureSilent, hasEverReceivedNonSilentAudio: false, permissionProblemReported: false, isRebuilding: false),
+            .waitingForSourceAudio
+        )
+        XCTAssertEqual(
+            CaptureHealth.status(for: .audioStarved, hasEverReceivedNonSilentAudio: true, permissionProblemReported: false, isRebuilding: false),
+            .reconnecting
+        )
+    }
+
     func testMeterLevel() {
         XCTAssertEqual(CaptureHealth.meterLevel(rms: 0), 0)
         XCTAssertEqual(CaptureHealth.meterLevel(rms: 1), 1, accuracy: 0.0001)

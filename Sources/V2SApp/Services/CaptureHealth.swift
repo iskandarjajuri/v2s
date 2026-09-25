@@ -200,11 +200,14 @@ enum CaptureHealth {
             return .reconnecting
         }
         switch verdict {
-        case .sourceIdle:
+        case .sourceIdle, .captureSilent:
+            // 出力中でも中身が無音なら、ユーザーから見れば「アプリが黙っている」。
+            // Chrome は一時停止中も AudioService が無音を出し続けるので、ここを「再接続中」に
+            // すると静かなロビーで永遠に再接続表示のままになる。実際の作り直しは isRebuilding で出す。
             return .waitingForSourceAudio
         case .healthy, .pipelineStalled:
             return hasEverReceivedNonSilentAudio ? .hearingAudio : .starting
-        case .audioStarved, .captureSilent:
+        case .audioStarved:
             return .reconnecting
         }
     }

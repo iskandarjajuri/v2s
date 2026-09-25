@@ -157,9 +157,10 @@ and what v2s hears:
 | Reconnecting audio… | The audio route changed (Bluetooth headset, browser audio process restarted) | Nothing; v2s rebuilds only the audio tap and keeps the recognizer running. |
 | No audio — check permission | The app is playing but v2s only receives silence | Click **Open Audio Recording Settings**, enable v2s under *System Audio Recording Only*, then restart v2s. If you rebuilt v2s, use `scripts/run-local.sh`. |
 
-Bluetooth headsets: capture no longer uses the output device as its clock, so switching a
-headset between music (A2DP) and call (HFP) mode, or connecting it mid-meeting, does not stop
-capture.
+Bluetooth headsets: capture no longer uses the output device as its clock. Verified: capture
+kept running when a Bluetooth headset disconnected mid-session. Not yet verified on hardware:
+the A2DP → HFP switch that happens when a meeting opens the headset microphone (the tap-format
+listener and the silence watchdog are there to cover it).
 
 ## License
 
