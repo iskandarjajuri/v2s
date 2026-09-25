@@ -13,7 +13,7 @@ final class OverlayWindowControllerTests: XCTestCase {
             settingsStore: SettingsStore(fileURL: settingsURL),
             sourceCatalogService: SourceCatalogService()
         )
-        let controller = OverlayWindowController(model: model, showTranscript: {})
+        let controller = OverlayWindowController(model: model, showTranscript: {}, openControls: {})
 
         XCTAssertTrue(controller.panelSharingTypesForTesting.allSatisfy { $0 == .readOnly })
 
