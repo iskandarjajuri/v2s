@@ -47,6 +47,15 @@
 		A0000000000000000000008E /* PopoverOutsideClickMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000008F /* PopoverOutsideClickMonitor.swift */; };
 		A00000000000000000000090 /* SentenceBoundaryHeuristics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000091 /* SentenceBoundaryHeuristics.swift */; };
 		A00000000000000000000094 /* TranscriptSummarizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000095 /* TranscriptSummarizer.swift */; };
+		B20000000000000000000001 /* TranslationQualityMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* TranslationQualityMode.swift */; };
+		B20000000000000000000002 /* PunctuationSegmenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* PunctuationSegmenter.swift */; };
+		B20000000000000000000003 /* CommittedPrefixAligner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* CommittedPrefixAligner.swift */; };
+		B20000000000000000000004 /* ReadingGlossary.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* ReadingGlossary.swift */; };
+		B20000000000000000000005 /* TranscriptExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* TranscriptExporter.swift */; };
+		B20000000000000000000006 /* TranslationPolisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* TranslationPolisher.swift */; };
+		B20000000000000000000007 /* SpokenTextCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* SpokenTextCleaner.swift */; };
+		B20000000000000000000008 /* PipelineSettingsCards.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* PipelineSettingsCards.swift */; };
+		B20000000000000000000009 /* ConversationHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* ConversationHistoryView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -91,6 +100,15 @@
 		A0000000000000000000008F /* PopoverOutsideClickMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PopoverOutsideClickMonitor.swift; sourceTree = "<group>"; };
 		A00000000000000000000091 /* SentenceBoundaryHeuristics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentenceBoundaryHeuristics.swift; sourceTree = "<group>"; };
 		A00000000000000000000095 /* TranscriptSummarizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptSummarizer.swift; sourceTree = "<group>"; };
+		B10000000000000000000001 /* TranslationQualityMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationQualityMode.swift; sourceTree = "<group>"; };
+		B10000000000000000000002 /* PunctuationSegmenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PunctuationSegmenter.swift; sourceTree = "<group>"; };
+		B10000000000000000000003 /* CommittedPrefixAligner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommittedPrefixAligner.swift; sourceTree = "<group>"; };
+		B10000000000000000000004 /* ReadingGlossary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadingGlossary.swift; sourceTree = "<group>"; };
+		B10000000000000000000005 /* TranscriptExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptExporter.swift; sourceTree = "<group>"; };
+		B10000000000000000000006 /* TranslationPolisher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationPolisher.swift; sourceTree = "<group>"; };
+		B10000000000000000000007 /* SpokenTextCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpokenTextCleaner.swift; sourceTree = "<group>"; };
+		B10000000000000000000008 /* PipelineSettingsCards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipelineSettingsCards.swift; sourceTree = "<group>"; };
+		B10000000000000000000009 /* ConversationHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistoryView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -184,6 +202,7 @@
 				A00000000000000000000038 /* SessionState.swift */,
 				A00000000000000000000084 /* SubtitleDisplayMode.swift */,
 				A00000000000000000000044 /* SubtitleSegment.swift */,
+				B10000000000000000000001 /* TranslationQualityMode.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -192,6 +211,12 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000046 /* GlossaryService.swift */,
+				B10000000000000000000007 /* SpokenTextCleaner.swift */,
+				B10000000000000000000006 /* TranslationPolisher.swift */,
+				B10000000000000000000005 /* TranscriptExporter.swift */,
+				B10000000000000000000004 /* ReadingGlossary.swift */,
+				B10000000000000000000003 /* CommittedPrefixAligner.swift */,
+				B10000000000000000000002 /* PunctuationSegmenter.swift */,
 				A00000000000000000000093 /* TranslationCoordinator.swift */,
 				A00000000000000000000041 /* LiveTranscriptionSession.swift */,
 				A00000000000000000000091 /* SentenceBoundaryHeuristics.swift */,
@@ -242,6 +267,8 @@
 				A0000000000000000000003D /* SettingsView.swift */,
 				A0000000000000000000003E /* SettingsWindowController.swift */,
 				A0000000000000000000007A /* TranscriptView.swift */,
+				B10000000000000000000009 /* ConversationHistoryView.swift */,
+				B10000000000000000000008 /* PipelineSettingsCards.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -366,7 +393,14 @@
 				A00000000000000000000058 /* SessionState.swift in Sources */,
 				A00000000000000000000083 /* SubtitleDisplayMode.swift in Sources */,
 				A00000000000000000000065 /* SubtitleSegment.swift in Sources */,
+				B20000000000000000000001 /* TranslationQualityMode.swift in Sources */,
 				A00000000000000000000067 /* GlossaryService.swift in Sources */,
+				B20000000000000000000007 /* SpokenTextCleaner.swift in Sources */,
+				B20000000000000000000006 /* TranslationPolisher.swift in Sources */,
+				B20000000000000000000005 /* TranscriptExporter.swift in Sources */,
+				B20000000000000000000004 /* ReadingGlossary.swift in Sources */,
+				B20000000000000000000003 /* CommittedPrefixAligner.swift in Sources */,
+				B20000000000000000000002 /* PunctuationSegmenter.swift in Sources */,
 				A00000000000000000000092 /* TranslationCoordinator.swift in Sources */,
 				A00000000000000000000090 /* SentenceBoundaryHeuristics.swift in Sources */,
 				A00000000000000000000094 /* TranscriptSummarizer.swift in Sources */,
@@ -383,6 +417,8 @@
 				A0000000000000000000005D /* SettingsView.swift in Sources */,
 				A0000000000000000000005E /* SettingsWindowController.swift in Sources */,
 				A00000000000000000000079 /* TranscriptView.swift in Sources */,
+				B20000000000000000000009 /* ConversationHistoryView.swift in Sources */,
+				B20000000000000000000008 /* PipelineSettingsCards.swift in Sources */,
 				A0000000000000000000008E /* PopoverOutsideClickMonitor.swift in Sources */,
 				A0000000000000000000005F /* StatusBarController.swift in Sources */,
 				A00000000000000000000060 /* StatusBarPopoverView.swift in Sources */,
