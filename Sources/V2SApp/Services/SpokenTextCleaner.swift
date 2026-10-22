@@ -103,7 +103,8 @@ enum SpokenTextCleaner {
     /// 五分 → 5分, 二千二十五年 → 2025年. A lone 一 is never converted (一緒, 一人), and 十分
     /// stays as is because it also means "enough".
     private static func normalizeJapaneseNumerals(_ text: String) -> String {
-        let pattern = #"([〇一二三四五六七八九十百千万]+)(?=\#(counterPattern))"#
+        // Bounded run length: recognizer output is arbitrary, and a long digit run must not reach the arithmetic below.
+        let pattern = #"(?<![〇一二三四五六七八九十百千万])([〇一二三四五六七八九十百千万]{1,12})(?=\#(counterPattern))"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
         let nsText = text as NSString
         var result = ""
@@ -132,26 +133,45 @@ enum SpokenTextCleaner {
         return last == "第"
     }
 
+    /// Value of a kanji numeral, or nil when it does not parse or would overflow.
     private static func kanjiNumeralValue(_ text: String) -> Int? {
         var total = 0
         var section = 0
         var pending: Int?
+
+        func add(_ lhs: Int, _ rhs: Int) -> Int? {
+            let (value, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? nil : value
+        }
+        func multiply(_ lhs: Int, _ rhs: Int) -> Int? {
+            let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+            return overflow ? nil : value
+        }
+
         for character in text {
             if let digit = kanjiDigits[character] {
-                pending = (pending ?? 0) * 10 + digit
+                guard let shifted = multiply(pending ?? 0, 10), let next = add(shifted, digit) else { return nil }
+                pending = next
                 continue
             }
             switch character {
-            case "十": section += (pending ?? 1) * 10; pending = nil
-            case "百": section += (pending ?? 1) * 100; pending = nil
-            case "千": section += (pending ?? 1) * 1_000; pending = nil
+            case "十", "百", "千":
+                let unit = character == "十" ? 10 : (character == "百" ? 100 : 1_000)
+                guard let scaled = multiply(pending ?? 1, unit), let next = add(section, scaled) else { return nil }
+                section = next
+                pending = nil
             case "万":
-                total += (section + (pending ?? 0)) * 10_000
-                section = 0; pending = nil
-            default: return nil
+                guard let sum = add(section, pending ?? 0), let scaled = multiply(sum, 10_000),
+                      let next = add(total, scaled) else { return nil }
+                total = next
+                section = 0
+                pending = nil
+            default:
+                return nil
             }
         }
-        return total + section + (pending ?? 0)
+        guard let sum = add(section, pending ?? 0) else { return nil }
+        return add(total, sum)
     }
 
     // MARK: English

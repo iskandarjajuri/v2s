@@ -91,3 +91,12 @@ final class SpokenTextCleanerTests: XCTestCase {
         XCTAssertEqual(SpokenTextCleaner.clean("Selamat pagi, eh, apa kabar", languageCode: "id"), "Selamat pagi, eh, apa kabar")
     }
 }
+
+extension SpokenTextCleanerTests {
+    func testOverlongKanjiDigitRunsAreLeftAloneInsteadOfOverflowing() {
+        let run = String(repeating: "九", count: 40)
+        XCTAssertEqual(ja(run + "年"), run + "年")
+        let huge = "九千九百九十九万九千九百九十九万九千九百九十九万九千九百九十九万九千九百九十九"
+        XCTAssertEqual(ja(huge + "円"), huge + "円")
+    }
+}
