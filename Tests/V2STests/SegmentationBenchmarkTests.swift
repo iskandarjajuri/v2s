@@ -30,6 +30,11 @@ final class SegmentationBenchmarkTests: XCTestCase {
         let metaData = try Data(contentsOf: audioDir.appendingPathComponent("meta.json"))
         let meta = try JSONSerialization.jsonObject(with: metaData) as? [String: [String: Any]] ?? [:]
 
+        var segmentation = SegmentationSettings.default
+        if env["V2S_BENCH_SEG"] == "off" { segmentation.isEnabled = false }
+        if let value = env["V2S_BENCH_MAXSEC"].flatMap(Double.init) { segmentation.maxContinuousSpeechSeconds = value }
+        if let value = env["V2S_BENCH_STABLE_MS"].flatMap(Int.init) { segmentation.stableLeadingMs = value }
+
         var runs: [Run] = []
         for name in names {
             guard let locale = meta[name]?["locale"] as? String else {
@@ -55,6 +60,7 @@ final class SegmentationBenchmarkTests: XCTestCase {
             try await session.replayForTesting(
                 audioFile: audioDir.appendingPathComponent("\(name).wav"),
                 localeIdentifier: locale,
+                segmentation: segmentation,
                 transcriptHandler: { record("commit", $0.text, promotion: $0.promotionSegmentID) },
                 partialHandler: { draft in
                     if let draft {

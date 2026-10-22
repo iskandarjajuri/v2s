@@ -179,6 +179,22 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var latestModernText = ""
     private var modernCommittedPrefixText = ""
 
+    // MARK: Punctuation-aware segmentation (captureQueue)
+    private var segmentation: SegmentationSettings = .default
+    /// When the current pending text first appeared (uninterrupted speech since the last commit).
+    private var modernPendingSince: Date?
+    /// Leading text the planner wants to commit early, and since when it has been unchanged.
+    private var punctuationCandidate: (text: String, since: Date)?
+    private var punctuationCommitTimer: DispatchSourceTimer?
+    /// Seconds of audio handed to the recognizer so far. The analyzer's result ranges use the
+    /// same clock, which lets us tell whether the transcript has caught up with a pause.
+    private var audioClockSeconds: Double = 0
+    private var latestResultAudioEnd: Double = 0
+    private var vadOffsetAudioTime: Double?
+    private var vadOffsetWallTime = Date.distantPast
+    /// Longest a VAD pause may wait for the transcript to catch up before giving up on it.
+    private let vadCoverageMaxWaitMs = 1_500
+
     private var microphoneCaptureSession: AVCaptureSession?
     private var applicationAudioCapture: ApplicationAudioCapture?
 
@@ -289,6 +305,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         localeIdentifier: String,
         interfaceLanguageID: String,
         modeConfig: ModeConfig = .balanced,
+        segmentation: SegmentationSettings = .default,
         contextualStrings: [String] = [],
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
@@ -301,6 +318,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
         self.modeConfig = modeConfig
+        self.segmentation = segmentation.clamped
         self.recognitionContextualStrings = sanitizeContextualStrings(contextualStrings)
         self.activeLocaleIdentifier = localeIdentifier
         self.interfaceLanguageID = interfaceLanguageID
@@ -764,6 +782,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         speechAnalyzerState = analyzer
         speechTranscriberState = transcriber
         analyzerInputFormat = preferredFormat
+        audioClockSeconds = 0
+        latestResultAudioEnd = 0
+        vadOffsetAudioTime = nil
         recognitionBackend = .speechAnalyzer
         recognitionRequest = nil
         recognitionTask = nil
@@ -903,6 +924,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private func resetModernTranscriptionState() {
         latestModernText = ""
         modernCommittedPrefixText = ""
+        modernPendingSince = nil
+        punctuationCandidate = nil
+        cancelPunctuationCommitTimer()
     }
 
     private func resetLegacyTranscriptionState() {
@@ -1129,6 +1153,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
+        audioClockSeconds += Double(processingBuffer.frameLength) / processingFormat.sampleRate
         let audioLevels = cleanUpSpeechBuffer(processingBuffer)
         if audioLevels.peak > digitalSilencePeak {
             lastNonSilentAudioTime = Date()
@@ -1157,9 +1182,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             }
 
             if vadResult.containsSpeechOffset {
+                vadOffsetAudioTime = audioClockSeconds
+                vadOffsetWallTime = Date()
                 scheduleVADSilenceCommit()
             }
             if vadResult.containsSpeechOnset {
+                vadOffsetAudioTime = nil
                 cancelVADSilenceTimer()
             }
         }
@@ -1762,6 +1790,12 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return String(fullText.dropFirst(modernCommittedPrefixText.count))
         }
 
+        // The recognizer revised words inside the part we already committed (昼ご飯 → 昼ごはん).
+        // Without this the whole history comes back as new text and is shown twice.
+        if let remainder = CommittedPrefixAligner.remainder(of: fullText, afterCommitted: modernCommittedPrefixText) {
+            return remainder
+        }
+
         let committedSentences = splitRecognizedSentences(in: modernCommittedPrefixText)
         let nsFullText = fullText as NSString
         let fullSentenceRanges = sentenceRanges(in: nsFullText)
@@ -2156,6 +2190,10 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         let now = Date()
         lastRecognitionResultTime = now
         lastRecognizerOutputTime = now
+        let resultAudioEnd = CMTimeGetSeconds(result.range.end)
+        if resultAudioEnd.isFinite {
+            latestResultAudioEnd = max(latestResultAudioEnd, resultAudioEnd)
+        }
         let fullText = normalizedTranscriberText(result.text)
         let pendingRawText = pendingModernText(from: fullText)
         let text = pendingRawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2191,12 +2229,18 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         guard text.isEmpty == false else {
             latestModernText = ""
+            modernPendingSince = nil
+            punctuationCandidate = nil
+            cancelPunctuationCommitTimer()
             cancelSilenceTimer()
             cancelVADSilenceTimer()
             Task { await emitPartialDraft(nil) }
             return
         }
 
+        if modernPendingSince == nil {
+            modernPendingSince = now
+        }
         observeDraftText(text, at: now)
         latestModernText = pendingRawText
         if let split = committableModernText(in: pendingRawText),
@@ -2214,6 +2258,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             cancelVADSilenceTimer()
             modernCommittedPrefixText += split.committedRawText
             latestModernText = split.remainingRawText
+            modernPendingSince = nil
+            punctuationCandidate = nil
+            cancelPunctuationCommitTimer()
             let committedDraftID = currentDraftId
             resetDraftState()
             Task {
@@ -2230,8 +2277,105 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
+        if let cut = evaluatePunctuationCut(on: pendingRawText, at: now) {
+            commitPunctuationCut(cut)
+            let remainingText = cut.remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+            if remainingText.isEmpty == false {
+                emitDraftUpdate(from: result, text: remainingText)
+                scheduleSilenceCommit()
+            }
+            return
+        }
+
         emitDraftUpdate(from: result, text: text)
         scheduleSilenceCommit()
+    }
+
+    // MARK: - Punctuation-aware early commit
+
+    private var segmentationLanguage: SegmentationLanguage {
+        switch activeHeuristicLanguage {
+        case .japanese: return .japanese
+        case .english: return .english
+        case .other: return .other
+        }
+    }
+
+    /// Asks the planner whether the pending text has a finished leading part worth committing
+    /// now, and applies the stability gate. Returns the cut once it has stayed unchanged for
+    /// `stableLeadingMs`; until then it arms a timer so a quiet recognizer cannot stall it.
+    private func evaluatePunctuationCut(on pendingRawText: String, at now: Date) -> PunctuationSegmenter.Cut? {
+        guard let cut = PunctuationSegmenter.plan(
+            pending: pendingRawText,
+            language: segmentationLanguage,
+            pendingAgeSeconds: now.timeIntervalSince(modernPendingSince ?? now),
+            settings: segmentation
+        ) else {
+            punctuationCandidate = nil
+            cancelPunctuationCommitTimer()
+            return nil
+        }
+
+        let since: Date
+        if let candidate = punctuationCandidate, candidate.text == cut.committed {
+            since = candidate.since
+        } else {
+            since = now
+            punctuationCandidate = (cut.committed, now)
+        }
+
+        let stableMs = Int(now.timeIntervalSince(since) * 1000)
+        if stableMs >= segmentation.stableLeadingMs {
+            return cut
+        }
+
+        schedulePunctuationCommitCheck(afterMs: segmentation.stableLeadingMs - stableMs)
+        return nil
+    }
+
+    private func commitPunctuationCut(_ cut: PunctuationSegmenter.Cut) {
+        let committedText = cut.committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard committedText.isEmpty == false else { return }
+
+        cancelSilenceTimer()
+        cancelVADSilenceTimer()
+        cancelPunctuationCommitTimer()
+        punctuationCandidate = nil
+        modernCommittedPrefixText += cut.committed
+        latestModernText = cut.remaining
+        modernPendingSince = cut.remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : Date()
+        let committedDraftID = currentDraftId
+        resetDraftState()
+        Task {
+            await emitCommittedSequence(
+                [CommittedEmission(text: committedText, promotionSegmentID: committedDraftID)],
+                clearDraftAfter: false
+            )
+        }
+    }
+
+    private func schedulePunctuationCommitCheck(afterMs: Int) {
+        cancelPunctuationCommitTimer()
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now() + .milliseconds(max(afterMs, 10)))
+        timer.setEventHandler { [weak self] in
+            self?.punctuationCommitCheckFired()
+        }
+        timer.resume()
+        punctuationCommitTimer = timer
+    }
+
+    private func cancelPunctuationCommitTimer() {
+        punctuationCommitTimer?.cancel()
+        punctuationCommitTimer = nil
+    }
+
+    private func punctuationCommitCheckFired() {
+        punctuationCommitTimer = nil
+        guard recognitionBackend == .speechAnalyzer else { return }
+        let now = Date()
+        guard let cut = evaluatePunctuationCut(on: latestModernText, at: now) else { return }
+        commitPunctuationCut(cut)
     }
 
     private func observeDraftText(_ text: String, at now: Date) {
@@ -2534,6 +2678,16 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 remainingRawText = split.remainingRawText
             case .vadOffset:
                 let now = Date()
+                // The transcript lags the audio: at the moment of a pause the recognizer has often
+                // not produced the last words yet. Committing now would cut mid-sentence, so wait
+                // until its results cover the pause (bounded, so a stuck recognizer cannot hold it).
+                if segmentation.isEnabled,
+                   let offsetTime = vadOffsetAudioTime,
+                   latestResultAudioEnd < offsetTime - 0.1,
+                   Int(now.timeIntervalSince(vadOffsetWallTime) * 1000) < vadCoverageMaxWaitMs {
+                    scheduleSilenceCommit(trigger: .vadOffset, afterMs: 150)
+                    return
+                }
                 guard canVADCommitModernDraft(latestModernText, at: now) else {
                     return
                 }
@@ -2549,6 +2703,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
             modernCommittedPrefixText += committedRawText
             latestModernText = remainingRawText
+            modernPendingSince = remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : Date()
+            punctuationCandidate = nil
+            cancelPunctuationCommitTimer()
             let committedDraftID = currentDraftId
             resetDraftState()
             Task {
@@ -3285,6 +3442,7 @@ extension LiveTranscriptionSession {
         audioFile: URL,
         localeIdentifier: String,
         modeConfig: ModeConfig = .balanced,
+        segmentation: SegmentationSettings = .default,
         speed: Double = 1.0,
         tailSeconds: Double = 3.0,
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
@@ -3293,6 +3451,7 @@ extension LiveTranscriptionSession {
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
         self.modeConfig = modeConfig
+        self.segmentation = segmentation.clamped
         self.activeLocaleIdentifier = localeIdentifier
         await MainActor.run {
             recentCommittedSentenceHistory.removeAll()
