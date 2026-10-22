@@ -54,6 +54,39 @@ enum AppTextKey: String {
     case attachToSource
     case invisibleInRecording
     case invisibleInRecordingHint
+    case conversation
+    case exportTranscript
+    case exportMarkdown
+    case exportPlainText
+    case jumpToLatest
+    case transcriptExportTitle
+    case segmentationSection
+    case segmentationEnabled
+    case segmentationHelp
+    case maxContinuousSpeech
+    case stableLeadingDelay
+    case cutAtJapaneseClauseEndings
+    case translationQuality
+    case translationModeProgressive
+    case translationModeNaturalOnly
+    case translationModeFastOnly
+    case translationModeHelp
+    case cleanSpokenText
+    case cleanSpokenTextHint
+    case readingGlossary
+    case readingGlossaryHint
+    case readingGlossaryTerm
+    case readingGlossaryReading
+    case readingGlossaryEmpty
+    case importFile
+    case overlayPosition
+    case overlayPositionTop
+    case overlayPositionBottom
+    case overlayTheme
+    case overlayThemeDark
+    case overlayThemeLight
+    case overlayThemeContrast
+    case overlayThemeColorful
     case subtitleColor
     case sourceSubtitleColor
     case backgroundColor
@@ -349,6 +382,39 @@ enum AppLocalization {
             "attachToSource": "Attach to Source",
             "invisibleInRecording": "Invisible in Recording",
             "invisibleInRecordingHint": "Subtitles stay on your screen but are left out of screen recordings, screenshots, and shared screens.",
+            "conversation": "Conversation",
+            "exportTranscript": "Export…",
+            "exportMarkdown": "Markdown (.md)",
+            "exportPlainText": "Plain text (.txt)",
+            "jumpToLatest": "Jump to latest",
+            "transcriptExportTitle": "v2s transcript",
+            "segmentationSection": "Subtitle segmentation",
+            "segmentationEnabled": "Punctuation-aware segmentation",
+            "segmentationHelp": "Commits finished sentences while the speaker keeps talking, and cuts inside a long sentence only after the limit below.",
+            "maxContinuousSpeech": "Max continuous speech",
+            "stableLeadingDelay": "Commit stability",
+            "cutAtJapaneseClauseEndings": "Also cut at Japanese clause endings (けど・ので・から)",
+            "translationQuality": "Translation quality",
+            "translationModeProgressive": "Fast, then natural",
+            "translationModeNaturalOnly": "Natural only",
+            "translationModeFastOnly": "Fast only",
+            "translationModeHelp": "Fast shows a plain translation in about 0.1 s and replaces it with the natural one when ready. Pairs without a fast model (such as Japanese ↔ English on some Macs) use the natural translation only.",
+            "cleanSpokenText": "Remove fillers before translating",
+            "cleanSpokenTextHint": "Drops えーと, あの, um… from the text sent to the translator. The original subtitle is unchanged.",
+            "readingGlossary": "Names & terms by sound",
+            "readingGlossaryHint": "Fixes names the recognizer spells wrong but hears right, before display and translation.",
+            "readingGlossaryTerm": "Term (e.g. 石橋誠)",
+            "readingGlossaryReading": "Reading (e.g. いしばしまこと)",
+            "readingGlossaryEmpty": "No names or terms yet.",
+            "importFile": "Import…",
+            "overlayPosition": "Position",
+            "overlayPositionTop": "Top of screen",
+            "overlayPositionBottom": "Above the Dock",
+            "overlayTheme": "Color theme",
+            "overlayThemeDark": "Dark",
+            "overlayThemeLight": "Light",
+            "overlayThemeContrast": "High contrast",
+            "overlayThemeColorful": "Colorful",
             "subtitleColor": "Translation Color",
             "sourceSubtitleColor": "Original Text Color",
             "backgroundColor": "Background Color",
@@ -1049,6 +1115,39 @@ enum AppLocalization {
             "attachToSource": "ソースに追従",
             "invisibleInRecording": "録画に映さない",
             "invisibleInRecordingHint": "字幕は画面に表示されたまま、画面収録・スクリーンショット・画面共有には映りません。",
+            "conversation": "会話",
+            "exportTranscript": "書き出し…",
+            "exportMarkdown": "Markdown (.md)",
+            "exportPlainText": "テキスト (.txt)",
+            "jumpToLatest": "最新へ移動",
+            "transcriptExportTitle": "v2s トランスクリプト",
+            "segmentationSection": "字幕の区切り",
+            "segmentationEnabled": "句読点を使った区切り",
+            "segmentationHelp": "話し続けている間も文が終わった時点で確定し、長い文は下の上限を超えたときだけ途中で区切ります。",
+            "maxContinuousSpeech": "連続発話の上限",
+            "stableLeadingDelay": "確定までの安定時間",
+            "cutAtJapaneseClauseEndings": "日本語の節末（けど・ので・から）でも区切る",
+            "translationQuality": "翻訳の品質",
+            "translationModeProgressive": "まず速く、その後自然に",
+            "translationModeNaturalOnly": "自然な翻訳のみ",
+            "translationModeFastOnly": "高速のみ",
+            "translationModeHelp": "高速モードは約0.1秒で簡易訳を表示し、自然な訳が出来たら置き換えます。高速モデルのない言語ペアでは自然な翻訳のみになります。",
+            "cleanSpokenText": "翻訳前にフィラーを除去",
+            "cleanSpokenTextHint": "翻訳に送るテキストから「えーと」「あの」などを除きます。原文字幕は変わりません。",
+            "readingGlossary": "名前・用語（読みで補正）",
+            "readingGlossaryHint": "認識結果の名前や用語を、綴りではなく読みで照合して表示・翻訳の前に補正します。",
+            "readingGlossaryTerm": "用語（例: 石橋誠）",
+            "readingGlossaryReading": "読み（例: いしばしまこと）",
+            "readingGlossaryEmpty": "まだ登録がありません。",
+            "importFile": "読み込み…",
+            "overlayPosition": "表示位置",
+            "overlayPositionTop": "画面の上",
+            "overlayPositionBottom": "Dock の上",
+            "overlayTheme": "配色テーマ",
+            "overlayThemeDark": "ダーク",
+            "overlayThemeLight": "ライト",
+            "overlayThemeContrast": "高コントラスト",
+            "overlayThemeColorful": "カラフル",
             "subtitleColor": "訳文の色",
             "sourceSubtitleColor": "原文の色",
             "backgroundColor": "背景色",

@@ -89,6 +89,7 @@ struct OverlayStyle: Codable, Equatable {
         case overlayScaleFactor
         case attachToSource
         case invisibleInRecording
+        case anchorsToBottom
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -118,6 +119,9 @@ struct OverlayStyle: Codable, Equatable {
     /// Keeps the overlay on screen for the user while excluding it from screen
     /// recordings, screenshots, and shared screens.
     var invisibleInRecording: Bool
+    /// Docks the subtitles to the bottom of the usable screen (above the Dock) instead of the top.
+    /// `topInset` is then the gap to the bottom edge.
+    var anchorsToBottom: Bool
 
     var scaledTranslatedFontSize: Double { translatedFontSize * overlayScaleFactor }
     var scaledSourceFontSize: Double { sourceFontSize * overlayScaleFactor }
@@ -140,7 +144,8 @@ struct OverlayStyle: Codable, Equatable {
         translatedFirst: true,
         overlayScaleFactor: 1.0,
         attachToSource: false,
-        invisibleInRecording: false
+        invisibleInRecording: false,
+        anchorsToBottom: false
     )
 
     init(
@@ -161,7 +166,8 @@ struct OverlayStyle: Codable, Equatable {
         translatedFirst: Bool,
         overlayScaleFactor: Double = 1.0,
         attachToSource: Bool = false,
-        invisibleInRecording: Bool = false
+        invisibleInRecording: Bool = false,
+        anchorsToBottom: Bool = false
     ) {
         self.targetDisplayID = targetDisplayID
         self.topInset = topInset
@@ -181,6 +187,7 @@ struct OverlayStyle: Codable, Equatable {
         self.overlayScaleFactor = overlayScaleFactor
         self.attachToSource = attachToSource
         self.invisibleInRecording = invisibleInRecording
+        self.anchorsToBottom = anchorsToBottom
     }
 
     init(from decoder: Decoder) throws {
@@ -211,5 +218,43 @@ struct OverlayStyle: Codable, Equatable {
         overlayScaleFactor = try c.decodeIfPresent(Double.self, forKey: .overlayScaleFactor) ?? 1.0
         attachToSource = try c.decodeIfPresent(Bool.self, forKey: .attachToSource) ?? false
         invisibleInRecording = try c.decodeIfPresent(Bool.self, forKey: .invisibleInRecording) ?? false
+        anchorsToBottom = try c.decodeIfPresent(Bool.self, forKey: .anchorsToBottom) ?? false
+    }
+}
+
+
+/// One-tap color schemes for the subtitle overlay. They only set colors (and the background
+/// strength where legibility needs it); sizes, position and the rest stay as the user left them.
+enum OverlayTheme: String, CaseIterable, Identifiable {
+    case dark
+    case light
+    case highContrast
+    case colorful
+
+    var id: String { rawValue }
+
+    func apply(to style: inout OverlayStyle) {
+        switch self {
+        case .dark:
+            style.subtitleColor = OverlayColor(red: 1, green: 1, blue: 1)
+            style.sourceSubtitleColor = OverlayColor(red: 0.62, green: 0.86, blue: 1)
+            style.backgroundColor = OverlayColor(red: 0, green: 0, blue: 0)
+            style.backgroundOpacity = max(style.backgroundOpacity, 0.32)
+        case .light:
+            style.subtitleColor = OverlayColor(red: 0.08, green: 0.08, blue: 0.1)
+            style.sourceSubtitleColor = OverlayColor(red: 0.2, green: 0.36, blue: 0.62)
+            style.backgroundColor = OverlayColor(red: 1, green: 1, blue: 1)
+            style.backgroundOpacity = max(style.backgroundOpacity, 0.6)
+        case .highContrast:
+            style.subtitleColor = OverlayColor(red: 1, green: 0.93, blue: 0.2)
+            style.sourceSubtitleColor = OverlayColor(red: 1, green: 1, blue: 1)
+            style.backgroundColor = OverlayColor(red: 0, green: 0, blue: 0)
+            style.backgroundOpacity = max(style.backgroundOpacity, 0.55)
+        case .colorful:
+            style.subtitleColor = OverlayColor(red: 0.55, green: 1, blue: 0.7)
+            style.sourceSubtitleColor = OverlayColor(red: 1, green: 0.78, blue: 0.45)
+            style.backgroundColor = OverlayColor(red: 0.05, green: 0.06, blue: 0.14)
+            style.backgroundOpacity = max(style.backgroundOpacity, 0.4)
+        }
     }
 }
