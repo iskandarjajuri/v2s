@@ -87,6 +87,10 @@ enum AppTextKey: String {
     case overlayThemeLight
     case overlayThemeContrast
     case overlayThemeColorful
+    case polishTranslations
+    case polishTranslationsHint
+    case polishUnsupportedLanguage
+    case polishUnavailable
     case subtitleColor
     case sourceSubtitleColor
     case backgroundColor
@@ -415,6 +419,10 @@ enum AppLocalization {
             "overlayThemeLight": "Light",
             "overlayThemeContrast": "High contrast",
             "overlayThemeColorful": "Colorful",
+            "polishTranslations": "Polish translations with Apple Intelligence",
+            "polishTranslationsHint": "After the natural translation, rewrites it on this Mac (never online) when it is ready, within 2.5 s. Off by default; it can add 1–3 s before the final wording appears.",
+            "polishUnsupportedLanguage": "Apple Intelligence does not support %@ on this Mac, so polishing is unavailable for this output language.",
+            "polishUnavailable": "Apple Intelligence is not available on this Mac right now.",
             "subtitleColor": "Translation Color",
             "sourceSubtitleColor": "Original Text Color",
             "backgroundColor": "Background Color",
@@ -1148,6 +1156,10 @@ enum AppLocalization {
             "overlayThemeLight": "ライト",
             "overlayThemeContrast": "高コントラスト",
             "overlayThemeColorful": "カラフル",
+            "polishTranslations": "Apple Intelligence で訳文を整える",
+            "polishTranslationsHint": "自然な訳が出た後、このMac上で（オンラインには送らず）2.5秒以内に書き換えます。既定はオフで、最終的な表現が出るまで1〜3秒余計にかかることがあります。",
+            "polishUnsupportedLanguage": "このMacの Apple Intelligence は %@ に対応していないため、この出力言語では使えません。",
+            "polishUnavailable": "このMacでは現在 Apple Intelligence を利用できません。",
             "subtitleColor": "訳文の色",
             "sourceSubtitleColor": "原文の色",
             "backgroundColor": "背景色",

@@ -20,6 +20,8 @@ struct AppSettings: Codable {
     var cleansSpokenText: Bool
     /// Names and terms corrected by sound before display and translation.
     var readingGlossary: [ReadingGlossaryEntry]
+    /// Optional on-device rewrite of finished translations (Apple Intelligence). Off by default.
+    var polishesTranslations: Bool
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
@@ -37,7 +39,8 @@ struct AppSettings: Codable {
         segmentation: .default,
         translationMode: .progressive,
         cleansSpokenText: true,
-        readingGlossary: []
+        readingGlossary: [],
+        polishesTranslations: false
     )
 
     // Custom decoder so existing settings files load cleanly as new fields are added.
@@ -74,6 +77,8 @@ struct AppSettings: Codable {
             ?? AppSettings.default.cleansSpokenText
         readingGlossary = (try? c.decodeIfPresent([ReadingGlossaryEntry].self, forKey: .readingGlossary))
             ?? AppSettings.default.readingGlossary
+        polishesTranslations = (try? c.decodeIfPresent(Bool.self, forKey: .polishesTranslations))
+            ?? AppSettings.default.polishesTranslations
     }
 
     init(
@@ -92,7 +97,8 @@ struct AppSettings: Codable {
         segmentation: SegmentationSettings = .default,
         translationMode: TranslationQualityMode = .progressive,
         cleansSpokenText: Bool = true,
-        readingGlossary: [ReadingGlossaryEntry] = []
+        readingGlossary: [ReadingGlossaryEntry] = [],
+        polishesTranslations: Bool = false
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -110,5 +116,6 @@ struct AppSettings: Codable {
         self.translationMode  = translationMode
         self.cleansSpokenText = cleansSpokenText
         self.readingGlossary  = readingGlossary
+        self.polishesTranslations = polishesTranslations
     }
 }

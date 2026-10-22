@@ -112,6 +112,28 @@ struct TranslationQualityCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+            let availability = model.polishAvailability
+            Toggle(model.localized(.polishTranslations), isOn: $model.polishesTranslations)
+                .disabled(availability != .available)
+            Text(polishHint(for: availability))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+extension TranslationQualityCard {
+    fileprivate func polishHint(for availability: TranslationPolishAvailability) -> String {
+        switch availability {
+        case .available:
+            return model.localized(.polishTranslationsHint)
+        case .unsupportedLanguage:
+            return model.localized(.polishUnsupportedLanguage, model.languageName(for: model.outputLanguageID))
+        case .modelUnavailable, .systemTooOld:
+            return model.localized(.polishUnavailable)
         }
     }
 }

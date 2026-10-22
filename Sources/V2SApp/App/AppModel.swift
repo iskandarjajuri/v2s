@@ -226,6 +226,20 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published var polishesTranslations: Bool {
+        didSet {
+            if polishesTranslations { translationPolisher.prewarm() }
+            persistSettings()
+        }
+    }
+
+    private let translationPolisher = TranslationPolisher()
+
+    /// Whether the on-device model can polish translations into the current output language.
+    var polishAvailability: TranslationPolishAvailability {
+        TranslationPolisher.availability(forTargetLanguageID: outputLanguageID)
+    }
+
     /// Compiled form of `readingGlossary`; rebuilt whenever the entries change.
     private var readingGlossaryEngine = ReadingGlossary(entries: [])
 
@@ -268,6 +282,7 @@ final class AppModel: ObservableObject {
         self.translationMode = settings.translationMode
         self.cleansSpokenText = settings.cleansSpokenText
         self.readingGlossary = settings.readingGlossary
+        self.polishesTranslations = settings.polishesTranslations
         self.readingGlossaryEngine = ReadingGlossary(entries: settings.readingGlossary)
         self.translationHostConfiguration = nil
         AppLocalization.updateEmbeddedBundleLocalizationLanguageID(self.interfaceLanguageID)
@@ -1097,7 +1112,8 @@ final class AppModel: ObservableObject {
             segmentation: segmentation,
             translationMode: translationMode,
             cleansSpokenText: cleansSpokenText,
-            readingGlossary: readingGlossary
+            readingGlossary: readingGlossary,
+            polishesTranslations: polishesTranslations
         )
 
         settingsStore.save(settings)
@@ -2921,6 +2937,23 @@ final class AppModel: ObservableObject {
             }
 
             updateReadyCaptionTranslation(translatedText, for: caption.id)
+
+            // Optional third pass: ask the on-device model to smooth the wording. It only ever replaces
+            // our own earlier revision (see shouldReplaceCommittedTranslation), is time-limited, and is
+            // skipped for languages the model does not support.
+            if polishesTranslations, mode != .fastOnly, needsTranslation,
+               let natural = translatedText,
+               TranslationPolisher.availability(forTargetLanguageID: caption.targetLanguageID) == .available {
+                let polished = await translationPolisher.polish(
+                    sourceText: caption.sourceText,
+                    translation: natural,
+                    sourceLanguageName: languageName(for: caption.sourceLanguageID),
+                    targetLanguageName: languageName(for: caption.targetLanguageID)
+                )
+                if Task.isCancelled == false, liveTranscriptionSession != nil, let polished {
+                    updateReadyCaptionTranslation(polished, for: caption.id)
+                }
+            }
             captionTranslationTasks[caption.id] = nil
         }
     }
