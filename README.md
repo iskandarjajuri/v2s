@@ -145,6 +145,19 @@ xcodebuild test -workspace .swiftpm/xcode/package.xcworkspace -scheme v2s \
   -destination 'platform=macOS' COREML_CODEGEN_LANGUAGE=Swift
 ```
 
+## Natural and fast subtitles
+
+These settings live in **Settings → General** (segmentation, translation quality) and the Glossary / Subtitle Overlay tabs. Every one of them can be switched off.
+
+- **Punctuation-aware segmentation.** Finished sentences are committed while the speaker keeps talking (after they stay unchanged for 250 ms). A sentence that runs past the *max continuous speech* limit (12 s by default) may be cut at a 、 or a Japanese clause ending (けど・ので・から). Decimals (`3.5`), thousands separators (`1,000`) and abbreviations (`Mr.`) are never cut. Applies to the modern speech path (for example Japanese and English); languages that fall back to the legacy recognizer keep the old behaviour.
+- **Translation quality.** *Fast, then natural* shows a low-latency translation (~0.1 s) and swaps in the natural one when it is ready. Pairs without a low-latency model (for example Japanese ↔ English on some Macs) use the natural translation only. Apple Translation has no context parameter, so earlier sentences cannot be passed along.
+- **Clean spoken text.** Fillers (えーと, あの, um) and stutters are dropped from the text sent to the translator; the original subtitle is unchanged.
+- **Names & terms by sound.** Corrects names the recognizer hears right but spells wrong, by matching readings. JSON import/export.
+- **Polish with Apple Intelligence** (off by default). Rewrites a finished translation on the Mac within 2.5 s; only for output languages the on-device model supports.
+- **Transcript → Conversation.** Scrollable history with timestamps and colors, exportable as Markdown or plain text.
+
+Reproducing the segmentation benchmark (no permissions needed): `LiveTranscriptionSession.replayForTesting` (DEBUG builds) replays an audio file through the production recognizer, VAD and commit logic. Run `SegmentationBenchmarkTests` with `TEST_RUNNER_V2S_BENCH_OUT=<file.json>`; the test is skipped otherwise.
+
 ## Troubleshooting: no subtitles from Google Meet / a browser
 
 Open the menu bar popover while the session runs. The **Audio** card shows a live level meter
