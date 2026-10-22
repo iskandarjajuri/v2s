@@ -35,6 +35,64 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.sourceOutputLanguageOverrides.isEmpty)
     }
 
+    func testSettingsWrittenBeforeNaturalFastFeaturesLoadWithDefaults() throws {
+        let json = """
+        {
+          "inputLanguageID": "ja",
+          "outputLanguageID": "id",
+          "overlayStyle": {
+            "topInset": 12, "widthRatio": 0.82, "minWidth": 720, "maxWidth": 1440,
+            "backgroundOpacity": 0.32, "translatedFontSize": 24, "sourceFontSize": 18, "clickThrough": true
+          },
+          "subtitleMode": "follow",
+          "subtitleDisplayMode": "both",
+          "glossary": { "CEO": "Direktur" },
+          "showInDock": true
+        }
+        """
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+
+        XCTAssertEqual(settings.subtitleMode, .follow)
+        XCTAssertEqual(settings.glossary, ["CEO": "Direktur"])
+        XCTAssertTrue(settings.showInDock)
+        XCTAssertEqual(settings.segmentation, .default)
+        XCTAssertEqual(settings.translationMode, .progressive)
+        XCTAssertTrue(settings.cleansSpokenText)
+        XCTAssertTrue(settings.readingGlossary.isEmpty)
+    }
+
+    func testNaturalFastSettingsRoundTrip() throws {
+        var settings = AppSettings.default
+        settings.segmentation = SegmentationSettings(isEnabled: false, maxContinuousSpeechSeconds: 9, stableLeadingMs: 300, cutAtJapaneseClauseEndings: false)
+        settings.translationMode = .fastOnly
+        settings.cleansSpokenText = false
+        settings.readingGlossary = [ReadingGlossaryEntry(term: "石橋誠", reading: "いしばしまこと", language: "ja")]
+
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+
+        XCTAssertEqual(decoded.segmentation, settings.segmentation)
+        XCTAssertEqual(decoded.translationMode, .fastOnly)
+        XCTAssertFalse(decoded.cleansSpokenText)
+        XCTAssertEqual(decoded.readingGlossary, settings.readingGlossary)
+    }
+
+    func testCorruptNewFieldsFallBackToDefaultsInsteadOfFailingTheWholeFile() throws {
+        let json = """
+        {
+          "inputLanguageID": "en", "outputLanguageID": "ja",
+          "overlayStyle": { "topInset": 12, "widthRatio": 0.8, "minWidth": 700, "maxWidth": 1400,
+            "backgroundOpacity": 0.3, "translatedFontSize": 24, "sourceFontSize": 18, "clickThrough": true },
+          "subtitleMode": "balanced", "subtitleDisplayMode": "both", "glossary": {},
+          "translationMode": "warp-speed",
+          "segmentation": "oops"
+        }
+        """
+        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+        XCTAssertEqual(settings.translationMode, .progressive)
+        XCTAssertEqual(settings.segmentation, .default)
+    }
+
     func testMultiSourceSettingsRoundTripPreservesOverrides() throws {
         let settings = AppSettings(
             selectedSourceID: "mic-1",

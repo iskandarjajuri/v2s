@@ -67,6 +67,15 @@ final class TranslationCoordinator: ObservableObject {
         }
     }
 
+    /// Which of Apple Translation's two strategies a request wants.
+    enum Fidelity: Sendable {
+        /// `lowLatency`: ~50-150 ms per sentence, plainer wording. Falls back to `.natural`
+        /// when the system, the language pair or its low-latency model does not support it.
+        case fast
+        /// The framework default (`highFidelity`): ~0.6-1.8 s per sentence, reads more naturally.
+        case natural
+    }
+
     private enum OperationWaitResult {
         case signaled
         case timedOut
@@ -122,6 +131,19 @@ final class TranslationCoordinator: ObservableObject {
     private var translationMemoOrder: [MemoKey] = []
     var consecutiveTimeouts: Int = 0
 
+    /// Low-latency sessions are created directly (no SwiftUI host) and run independently of
+    /// the serial host queue, so a slow high-fidelity translation never delays a draft.
+    private var fastSessions: [LanguagePair: AnyObject] = [:]
+    /// Pairs whose low-latency model is not installed on this Mac (ja<->en at the time of writing).
+    private var fastUnavailablePairs: Set<LanguagePair> = []
+
+    /// Whether the fast path has been ruled out for this pair (so callers can skip a pointless
+    /// draft translation, or label the mode honestly in the UI).
+    func isFastTranslationAvailable(from sourceIdentifier: String, to targetIdentifier: String) -> Bool {
+        guard #available(macOS 26.4, *) else { return false }
+        return fastUnavailablePairs.contains(LanguagePair(source: sourceIdentifier, target: targetIdentifier)) == false
+    }
+
     func prepareIfNeeded(
         from sourceIdentifier: String,
         to targetIdentifier: String
@@ -160,7 +182,12 @@ final class TranslationCoordinator: ObservableObject {
         }
     }
 
-    func translate(_ text: String, from sourceIdentifier: String, to targetIdentifier: String) async throws -> String {
+    func translate(
+        _ text: String,
+        from sourceIdentifier: String,
+        to targetIdentifier: String,
+        fidelity: Fidelity = .natural
+    ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedText.isEmpty == false else {
             return ""
@@ -171,6 +198,10 @@ final class TranslationCoordinator: ObservableObject {
         }
 
         let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
+        if fidelity == .fast, let fast = await translateFast(trimmedText, pair: pair) {
+            return fast
+        }
+
         if let memoized = translationMemo[MemoKey(pair: pair, text: trimmedText)] {
             return memoized
         }
@@ -293,7 +324,51 @@ final class TranslationCoordinator: ObservableObject {
         }
     }
 
+    /// Direct low-latency translation. Returns nil whenever the fast path cannot serve the
+    /// request, in which case the caller falls back to the regular (natural) queue.
+    private func translateFast(_ text: String, pair: LanguagePair) async -> String? {
+        guard #available(macOS 26.4, *), fastUnavailablePairs.contains(pair) == false else {
+            return nil
+        }
+
+        // The direct session only works for installed languages; leave downloads to the host path.
+        guard let status = try? await availabilityStatus(for: pair), status == .installed else {
+            return nil
+        }
+
+        let requestGeneration = generation
+        let session = fastSession(for: pair)
+        do {
+            let response = try await session.translate(text)
+            guard requestGeneration == generation else { return nil }
+            let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return translated.isEmpty ? nil : translated
+        } catch TranslationError.notInstalled {
+            fastUnavailablePairs.insert(pair)
+            fastSessions.removeValue(forKey: pair)
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    @available(macOS 26.4, *)
+    private func fastSession(for pair: LanguagePair) -> TranslationSession {
+        if let existing = fastSessions[pair] as? TranslationSession {
+            return existing
+        }
+        let session = TranslationSession(
+            installedSource: Locale.Language(identifier: localeIdentifier(for: pair.source)),
+            target: Locale.Language(identifier: localeIdentifier(for: pair.target)),
+            preferredStrategy: .lowLatency
+        )
+        fastSessions[pair] = session
+        return session
+    }
+
     func reset() {
+        fastSessions.removeAll()
+        fastUnavailablePairs.removeAll()
         generation &+= 1
         cancelOutstandingOperations()
         currentPair = nil
