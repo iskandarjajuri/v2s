@@ -3274,3 +3274,59 @@ private extension URL {
         return nil
     }
 }
+
+#if DEBUG
+extension LiveTranscriptionSession {
+    /// Benchmark/test hook: replays an audio file through the same ASR, VAD, timer and
+    /// commit logic a live capture uses, paced like a real device (scaled by `speed`).
+    /// Permissions and the capture device are skipped; everything downstream of
+    /// `append(audioBuffer:)` is the production path.
+    func replayForTesting(
+        audioFile: URL,
+        localeIdentifier: String,
+        modeConfig: ModeConfig = .balanced,
+        speed: Double = 1.0,
+        tailSeconds: Double = 3.0,
+        transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
+        partialHandler: @escaping @MainActor (DraftSegment?) -> Void
+    ) async throws {
+        self.transcriptHandler = transcriptHandler
+        self.partialHandler = partialHandler
+        self.modeConfig = modeConfig
+        self.activeLocaleIdentifier = localeIdentifier
+        await MainActor.run {
+            recentCommittedSentenceHistory.removeAll()
+        }
+
+        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+            try await runOnCaptureQueue {
+                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+            }
+        }
+
+        let file = try AVAudioFile(forReading: audioFile)
+        let format = file.processingFormat
+        let chunkFrames = AVAudioFrameCount(format.sampleRate / 10)
+        let chunkNanoseconds = UInt64(0.1 / speed * 1_000_000_000)
+
+        while file.framePosition < file.length {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+            try file.read(into: buffer, frameCount: chunkFrames)
+            captureQueue.async { [self] in append(audioBuffer: buffer) }
+            try await Task.sleep(nanoseconds: chunkNanoseconds)
+        }
+
+        // A live device keeps delivering (silent) buffers after the speaker stops, which is
+        // what lets the VAD see the end of speech.
+        let silentTicks = Int(tailSeconds * 10)
+        for _ in 0..<silentTicks {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+            buffer.frameLength = chunkFrames
+            captureQueue.async { [self] in append(audioBuffer: buffer) }
+            try await Task.sleep(nanoseconds: chunkNanoseconds)
+        }
+
+        await stopAndWait()
+    }
+}
+#endif
