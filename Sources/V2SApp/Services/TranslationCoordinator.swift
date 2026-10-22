@@ -30,6 +30,13 @@ final class TranslationCoordinator: ObservableObject {
         let text: String
     }
 
+    enum Priority {
+        /// Captions on screen or about to be shown, and live drafts.
+        case normal
+        /// Transcript-only work that runs only when no normal request is waiting.
+        case background
+    }
+
     private enum PendingOperation {
         case prepare(
             id: UUID,
@@ -42,27 +49,37 @@ final class TranslationCoordinator: ObservableObject {
             generation: Int,
             pair: LanguagePair,
             text: String,
+            priority: Priority,
             continuation: CheckedContinuation<String, Error>
         )
 
         var id: UUID {
             switch self {
-            case .prepare(let id, _, _, _), .translate(let id, _, _, _, _):
+            case .prepare(let id, _, _, _), .translate(let id, _, _, _, _, _):
                 return id
             }
         }
 
         var generation: Int {
             switch self {
-            case .prepare(_, let generation, _, _), .translate(_, let generation, _, _, _):
+            case .prepare(_, let generation, _, _), .translate(_, let generation, _, _, _, _):
                 return generation
             }
         }
 
         var pair: LanguagePair {
             switch self {
-            case .prepare(_, _, let pair, _), .translate(_, _, let pair, _, _):
+            case .prepare(_, _, let pair, _), .translate(_, _, let pair, _, _, _):
                 return pair
+            }
+        }
+
+        var priority: Priority {
+            switch self {
+            case .prepare:
+                return .normal
+            case .translate(_, _, _, _, let priority, _):
+                return priority
             }
         }
     }
@@ -186,7 +203,8 @@ final class TranslationCoordinator: ObservableObject {
         _ text: String,
         from sourceIdentifier: String,
         to targetIdentifier: String,
-        fidelity: Fidelity = .natural
+        fidelity: Fidelity = .natural,
+        priority: Priority = .normal
     ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedText.isEmpty == false else {
@@ -221,6 +239,7 @@ final class TranslationCoordinator: ObservableObject {
                         generation: requestGeneration,
                         pair: pair,
                         text: trimmedText,
+                        priority: priority,
                         continuation: continuation
                     )
                 )
@@ -258,8 +277,8 @@ final class TranslationCoordinator: ObservableObject {
             if activeRunnerID == runnerID {
                 activeRunnerID = nil
                 signalRunnerAvailabilityWaiters()
-                if generation == runnerGeneration, let nextPair = pendingOperations.first?.pair {
-                    activate(pair: nextPair)
+                if generation == runnerGeneration, let nextIndex = nextPendingOperationIndex() {
+                    activate(pair: pendingOperations[nextIndex].pair)
                 }
             }
         }
@@ -300,7 +319,7 @@ final class TranslationCoordinator: ObservableObject {
                     finishOperation(id: id, continuation: continuation, error: error)
                 }
 
-            case .translate(let id, _, let pair, let text, let continuation):
+            case .translate(let id, _, let pair, let text, _, let continuation):
                 do {
                     let response = try await session.translate(text)
                     let translatedText = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -482,9 +501,17 @@ final class TranslationCoordinator: ObservableObject {
         switch operation {
         case .prepare(_, _, _, let continuation):
             continuation.resume(throwing: CancellationError())
-        case .translate(_, _, _, _, let continuation):
+        case .translate(_, _, _, _, _, let continuation):
             continuation.resume(throwing: CancellationError())
         }
+    }
+
+    /// First queued operation to run: normal requests go ahead of background ones.
+    private func nextPendingOperationIndex(
+        where matches: (PendingOperation) -> Bool = { _ in true }
+    ) -> Int? {
+        pendingOperations.firstIndex { matches($0) && $0.priority == .normal }
+            ?? pendingOperations.firstIndex(where: matches)
     }
 
     @available(macOS 15.0, *)
@@ -500,9 +527,15 @@ final class TranslationCoordinator: ObservableObject {
                 return nil
             }
 
-            if let index = pendingOperations.firstIndex(where: {
+            if let index = nextPendingOperationIndex(where: {
                 $0.pair == pair && $0.generation == generation
             }) {
+                // Only background work is left for this pair: yield to another pair's
+                // normal work first. The runner exit activates that pair.
+                if pendingOperations[index].priority == .background,
+                   pendingOperations.contains(where: { $0.priority == .normal && $0.generation == generation }) {
+                    return nil
+                }
                 return pendingOperations.remove(at: index)
             }
 

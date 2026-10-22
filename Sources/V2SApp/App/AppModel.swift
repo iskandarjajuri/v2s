@@ -22,8 +22,8 @@ private struct SessionStartupFailure: Error, AppLocalizableError {
 }
 
 private enum AppBuildInfo {
-    static let marketingVersion = "0.3.38"
-    static let buildNumber = "42"
+    static let marketingVersion = "0.3.39"
+    static let buildNumber = "43"
     static let repositoryURLString = "https://github.com/franklioxygen/v2s"
     static let repositoryURL = URL(string: repositoryURLString)
 }
@@ -44,6 +44,7 @@ final class AppModel: ObservableObject {
     private var captionTranslationTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingCaptions: [QueuedCaption] = []
     private var readyCaptionTranslations: [UUID: String] = [:]
+    private var skippedCaptionsAwaitingTranslation: [QueuedCaption] = []
     private var captionTranslationWaiters: [UUID: [UUID: CheckedContinuation<String?, Never>]] = [:]
     private var displayedCaption: QueuedCaption?
     private var isBootstrapping = true
@@ -1448,7 +1449,7 @@ final class AppModel: ObservableObject {
             return nil
         }
 
-        let transcriber = makeSpeechTranscriber(locale: resolvedLocale)
+        let transcriber = LiveTranscriptionSession.makeSpeechTranscriber(locale: resolvedLocale)
 
         do {
             try await ensureSpeechAssetsReady(
@@ -1814,16 +1815,6 @@ final class AppModel: ObservableObject {
             group.cancelAll()
             _ = result
         }
-    }
-
-    @available(macOS 26.0, *)
-    private func makeSpeechTranscriber(locale: Locale) -> SpeechTranscriber {
-        SpeechTranscriber(
-            locale: locale,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
-        )
     }
 
     private func normalizedProgressValue(_ fractionCompleted: Double) -> Double? {
@@ -2249,6 +2240,7 @@ final class AppModel: ObservableObject {
 
             rememberRecognizedSentence(sourceText)
             pendingCaptions.append(caption)
+            recordCaptionInTranscript(caption)
             translateCaption(caption)
         } else {
             cancelCommittedCaptionArchive()
@@ -2269,6 +2261,7 @@ final class AppModel: ObservableObject {
 
             rememberRecognizedSentence(sourceText)
             pendingCaptions.append(caption)
+            recordCaptionInTranscript(caption)
             translateCaption(caption)
         }
 
@@ -2279,12 +2272,7 @@ final class AppModel: ObservableObject {
         // backfilled into the transcript, so the full record stays complete.
         while pendingCaptions.count > 3 {
             let dropped = pendingCaptions.remove(at: 1)
-            upsertTranscriptEntry(
-                id: dropped.id,
-                sourceText: dropped.sourceText,
-                translatedText: readyCaptionTranslations[dropped.id] ?? "",
-                sourceName: dropped.sourceName
-            )
+            keepTranslatingSkippedCaption(dropped)
             updateReadyCaptionTranslation(nil, for: dropped.id)
         }
 
@@ -2320,6 +2308,60 @@ final class AppModel: ObservableObject {
         languageID.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map { String($0).lowercased() } ?? languageID
     }
 
+    /// Writes the caption to the transcript as soon as it is recognized, so sentences
+    /// skipped on the overlay or still queued when the session stops are kept, in
+    /// spoken order. The display path and late translations update the entry in place.
+    private func recordCaptionInTranscript(_ caption: QueuedCaption) {
+        guard caption.sourceLanguageID != caption.targetLanguageID else {
+            upsertTranscriptEntry(
+                id: caption.id,
+                sourceText: caption.sourceText,
+                translatedText: caption.sourceText
+            )
+            return
+        }
+
+        let initialTranslation = initialCaptionTranslation(for: caption) ?? ""
+        if initialTranslation.isEmpty == false {
+            // Let the final translation replace the draft translation when it arrives.
+            translationRevisions[caption.id] = initialTranslation
+        }
+
+        upsertTranscriptEntry(
+            id: caption.id,
+            sourceText: caption.sourceText,
+            translatedText: initialTranslation
+        )
+    }
+
+    /// Best translation available before the final one: a finished caption translation,
+    /// else the draft translation that was visible when the caption was promoted.
+    private func initialCaptionTranslation(for caption: QueuedCaption) -> String? {
+        readyCaptionTranslations[caption.id]
+            ?? (caption.promotedDraftTranslation?.isEmpty == false ? caption.promotedDraftTranslation : nil)
+    }
+
+    /// A caption skipped on the overlay is still in the transcript, so keep translating it
+    /// for applyLateCaptionTranslation to backfill, but behind the captions still to be
+    /// shown so it can't delay them.
+    private func keepTranslatingSkippedCaption(_ caption: QueuedCaption) {
+        guard caption.sourceLanguageID != caption.targetLanguageID,
+              readyCaptionTranslations[caption.id] == nil else {
+            return
+        }
+
+        skippedCaptionsAwaitingTranslation.append(caption)
+        translateCaption(caption, priority: .background)
+    }
+
+    /// Recovery and refresh cancel every queued translation, so reissue the ones skipped
+    /// captions still need for their transcript entries.
+    private func retranslateSkippedCaptions() {
+        for caption in skippedCaptionsAwaitingTranslation {
+            translateCaption(caption, priority: .background)
+        }
+    }
+
     private func refreshCaptionTranslations() {
         guard liveTranscriptionSession != nil else {
             return
@@ -2331,6 +2373,7 @@ final class AppModel: ObservableObject {
         for caption in pendingCaptions {
             translateCaption(caption)
         }
+        retranslateSkippedCaptions()
 
         if let displayedCaption {
             Task { @MainActor [weak self] in
@@ -2438,6 +2481,7 @@ final class AppModel: ObservableObject {
         resumeAllCaptionTranslationWaiters()
         pendingCaptions.removeAll()
         readyCaptionTranslations.removeAll()
+        skippedCaptionsAwaitingTranslation.removeAll()
         translationRevisions.removeAll()
         recentRecognizedCaptionTexts.removeAll()
         recentArchivedCaption = nil
@@ -2496,8 +2540,7 @@ final class AppModel: ObservableObject {
             // 2. Draft translation captured at the promotion moment
             // 3. Leave the translated slot empty until the final translation arrives
             let earlyTranslation = readyCaptionTranslations[caption.id]
-            let initialTranslation = earlyTranslation
-                ?? (caption.promotedDraftTranslation?.isEmpty == false ? caption.promotedDraftTranslation : nil)
+            let initialTranslation = initialCaptionTranslation(for: caption)
             let translationExpected = caption.sourceLanguageID != caption.targetLanguageID
 
             cancelCommittedCaptionArchive()
@@ -2569,6 +2612,7 @@ final class AppModel: ObservableObject {
                 for captionToRetry in captionsToRetry {
                     translateCaption(captionToRetry)
                 }
+                retranslateSkippedCaptions()
             }
 
             updateCommittedOverlay(
@@ -2879,7 +2923,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func translateCaption(_ caption: QueuedCaption) {
+    private func translateCaption(
+        _ caption: QueuedCaption,
+        priority: TranslationCoordinator.Priority = .normal
+    ) {
         captionTranslationTasks[caption.id]?.cancel()
 
         captionTranslationTasks[caption.id] = Task { @MainActor [weak self] in
@@ -2900,7 +2947,7 @@ final class AppModel: ObservableObject {
                ) {
                 fastTask = Task { @MainActor [weak self] in
                     guard let self,
-                          let fast = await translatedText(for: caption, fidelity: .fast) else { return }
+                          let fast = await translatedText(for: caption, fidelity: .fast, priority: priority) else { return }
                     guard Task.isCancelled == false,
                           naturalFinished == false,
                           liveTranscriptionSession != nil else { return }
@@ -2917,7 +2964,7 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            let translatedText = await translatedText(for: caption, fidelity: .natural)
+            let translatedText = await translatedText(for: caption, fidelity: .natural, priority: priority)
             naturalFinished = true
             fastTask?.cancel()
             guard Task.isCancelled == false,
@@ -2955,6 +3002,9 @@ final class AppModel: ObservableObject {
                 }
             }
             captionTranslationTasks[caption.id] = nil
+            if translatedText != nil {
+                skippedCaptionsAwaitingTranslation.removeAll { $0.id == caption.id }
+            }
         }
     }
 
@@ -3134,7 +3184,8 @@ final class AppModel: ObservableObject {
 
     private func translatedText(
         for caption: QueuedCaption,
-        fidelity: TranslationCoordinator.Fidelity = .natural
+        fidelity: TranslationCoordinator.Fidelity = .natural,
+        priority: TranslationCoordinator.Priority = .normal
     ) async -> String? {
         guard caption.sourceLanguageID != caption.targetLanguageID else {
             return caption.sourceText
@@ -3149,7 +3200,8 @@ final class AppModel: ObservableObject {
                 translationInput(caption.sourceText, languageID: caption.sourceLanguageID),
                 from: caption.sourceLanguageID,
                 to: caption.targetLanguageID,
-                fidelity: fidelity
+                fidelity: fidelity,
+                priority: priority
             )
         } catch {
             raw = nil
