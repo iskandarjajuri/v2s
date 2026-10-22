@@ -53,6 +53,7 @@ final class AppModel: ObservableObject {
     private var draftClearTask: Task<Void, Never>?
     private var committedCaptionArchiveTask: Task<Void, Never>?
     private var languageResourcePreparationTask: Task<Void, Never>?
+    private var languageResourcePreparationGeneration = 0
     private var languageCatalogRefreshTask: Task<Void, Never>?
     private var isRefreshingLanguageCatalogs = false
     private var activeDraftSourceLanguageID: String?
@@ -1326,18 +1327,32 @@ final class AppModel: ObservableObject {
         languageResourcePreparationTask?.cancel()
         languageResourceStatuses = []
 
+        languageResourcePreparationGeneration &+= 1
+        let preparationGeneration = languageResourcePreparationGeneration
+
         languageResourcePreparationTask = Task { @MainActor [weak self] in
             guard let self else {
                 return
             }
 
-            defer { self.languageResourcePreparationTask = nil }
+            // A cancelled predecessor finishes after its replacement was stored; it must not
+            // clear the replacement.
+            defer {
+                if self.languageResourcePreparationGeneration == preparationGeneration {
+                    self.languageResourcePreparationTask = nil
+                }
+            }
 
             await self.prepareSelectedLanguageResources(
                 speechLanguageIDs: requirements.speechLanguageIDs,
                 translationPairs: requirements.translationPairs,
                 openSystemSettingsIfNeeded: openSystemSettingsIfNeeded
             )
+
+            if Task.isCancelled == false {
+                // Anything still marked "in progress" after a finished run is stale.
+                self.languageResourceStatuses.removeAll { $0.isError == false }
+            }
 
             guard Task.isCancelled == false,
                   refreshTranslations,
@@ -1844,6 +1859,12 @@ final class AppModel: ObservableObject {
     }
 
     private func upsertLanguageResourceStatus(_ status: LanguageResourceStatus) {
+        // A superseded preparation can still reach here after its replacement cleared the list.
+        // Its row would never be removed and would keep the Start button on "Wait" forever.
+        guard Task.isCancelled == false else {
+            return
+        }
+
         if let existingIndex = languageResourceStatuses.firstIndex(where: { $0.id == status.id }) {
             languageResourceStatuses[existingIndex] = status
         } else {
