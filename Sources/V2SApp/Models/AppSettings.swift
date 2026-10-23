@@ -14,6 +14,14 @@ struct AppSettings: Codable {
     var glossary: [String: String]
     // 有効にすると Dock にアプリアイコンを常時表示する（.regular）。既定は menu-bar 専用（.accessory）。
     var showInDock: Bool
+    var segmentation: SegmentationSettings
+    var translationMode: TranslationQualityMode
+    /// Strip fillers and stutters from the text sent to the translator (the subtitle keeps the original).
+    var cleansSpokenText: Bool
+    /// Names and terms corrected by sound before display and translation.
+    var readingGlossary: [ReadingGlossaryEntry]
+    /// Optional on-device rewrite of finished translations (Apple Intelligence). Off by default.
+    var polishesTranslations: Bool
 
     static let `default` = AppSettings(
         selectedSourceID: nil,
@@ -27,7 +35,12 @@ struct AppSettings: Codable {
         subtitleMode: .balanced,
         subtitleDisplayMode: .both,
         glossary: [:],
-        showInDock: false
+        showInDock: false,
+        segmentation: .default,
+        translationMode: .progressive,
+        cleansSpokenText: true,
+        readingGlossary: [],
+        polishesTranslations: false
     )
 
     // Custom decoder so existing settings files load cleanly as new fields are added.
@@ -56,6 +69,16 @@ struct AppSettings: Codable {
             ?? AppSettings.default.glossary
         showInDock = (try? c.decodeIfPresent(Bool.self, forKey: .showInDock))
             ?? AppSettings.default.showInDock
+        segmentation = (try? c.decodeIfPresent(SegmentationSettings.self, forKey: .segmentation))
+            ?? AppSettings.default.segmentation
+        translationMode = (try? c.decodeIfPresent(TranslationQualityMode.self, forKey: .translationMode))
+            ?? AppSettings.default.translationMode
+        cleansSpokenText = (try? c.decodeIfPresent(Bool.self, forKey: .cleansSpokenText))
+            ?? AppSettings.default.cleansSpokenText
+        readingGlossary = (try? c.decodeIfPresent([ReadingGlossaryEntry].self, forKey: .readingGlossary))
+            ?? AppSettings.default.readingGlossary
+        polishesTranslations = (try? c.decodeIfPresent(Bool.self, forKey: .polishesTranslations))
+            ?? AppSettings.default.polishesTranslations
     }
 
     init(
@@ -70,7 +93,12 @@ struct AppSettings: Codable {
         subtitleMode: SubtitleMode,
         subtitleDisplayMode: SubtitleDisplayMode,
         glossary: [String: String],
-        showInDock: Bool = false
+        showInDock: Bool = false,
+        segmentation: SegmentationSettings = .default,
+        translationMode: TranslationQualityMode = .progressive,
+        cleansSpokenText: Bool = true,
+        readingGlossary: [ReadingGlossaryEntry] = [],
+        polishesTranslations: Bool = false
     ) {
         self.selectedSourceID = selectedSourceID
         self.selectedSourceIDs = selectedSourceIDs
@@ -84,5 +112,10 @@ struct AppSettings: Codable {
         self.subtitleDisplayMode = subtitleDisplayMode
         self.glossary         = glossary
         self.showInDock       = showInDock
+        self.segmentation     = segmentation
+        self.translationMode  = translationMode
+        self.cleansSpokenText = cleansSpokenText
+        self.readingGlossary  = readingGlossary
+        self.polishesTranslations = polishesTranslations
     }
 }

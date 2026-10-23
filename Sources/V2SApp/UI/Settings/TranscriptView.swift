@@ -46,7 +46,7 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
 
 struct TranscriptView: View {
     @ObservedObject var model: AppModel
-    @State private var selectedTab: TranscriptTab = .origin
+    @State private var selectedTab: TranscriptTab = .conversation
     @State private var isSummarizeEnabled = false
     @State private var summarizedText: [TranscriptTab: String] = [:]
     @State private var isSummarizing = false
@@ -55,7 +55,7 @@ struct TranscriptView: View {
     @State private var summarizeGeneration = 0
 
     enum TranscriptTab: String, CaseIterable {
-        case origin, translation
+        case conversation, origin, translation
     }
 
     var body: some View {
@@ -63,6 +63,9 @@ struct TranscriptView: View {
             headerBar
             Divider()
             TabView(selection: $selectedTab) {
+                ConversationHistoryView(model: model)
+                    .tabItem { Text(model.localized(.conversation)) }
+                    .tag(TranscriptTab.conversation)
                 transcriptTab(tab: .origin)
                     .tabItem { Text(model.localized(.origin)) }
                     .tag(TranscriptTab.origin)
@@ -160,6 +163,14 @@ struct TranscriptView: View {
             .controlSize(.regular)
             .disabled(model.hasTranscript == false)
 
+            Menu(model.localized(.exportTranscript)) {
+                Button(model.localized(.exportMarkdown)) { export(as: .markdown) }
+                Button(model.localized(.exportPlainText)) { export(as: .plainText) }
+            }
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .disabled(model.hasTranscript == false)
+
             Button(model.localized(.copy)) {
                 copyCurrentText()
             }
@@ -173,6 +184,7 @@ struct TranscriptView: View {
     private var summarizeToggle: some View {
         Toggle(model.localized(.summarize), isOn: $isSummarizeEnabled)
             .toggleStyle(.switch)
+            .disabled(selectedTab == .conversation)
             .onChange(of: isSummarizeEnabled) { _, enabled in
                 summarizeError = nil
                 if enabled {
@@ -186,12 +198,15 @@ struct TranscriptView: View {
     // MARK: - Data Helpers
 
     private func fullText(for tab: TranscriptTab) -> String {
-        model.transcriptText(isTranslation: tab == .translation)
+        if tab == .conversation {
+            return TranscriptExporter.plainText(entries: model.transcriptEntries)
+        }
+        return model.transcriptText(isTranslation: tab == .translation)
     }
 
     private func summaryLanguageID(for tab: TranscriptTab) -> String {
         switch tab {
-        case .origin:
+        case .origin, .conversation:
             return model.transcriptSourceLanguageID
         case .translation:
             return model.transcriptTargetLanguageID
@@ -208,6 +223,41 @@ struct TranscriptView: View {
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // MARK: - Export
+
+    private enum ExportFormat {
+        case markdown, plainText
+    }
+
+    private func export(as format: ExportFormat) {
+        let entries = model.transcriptEntries
+        guard entries.isEmpty == false else { return }
+
+        let content: String
+        let fileExtension: String
+        switch format {
+        case .markdown:
+            content = TranscriptExporter.markdown(
+                entries: entries,
+                header: .init(
+                    title: model.localized(.transcriptExportTitle),
+                    sourceLanguageName: model.languageName(for: model.transcriptSourceLanguageID),
+                    targetLanguageName: model.languageName(for: model.transcriptTargetLanguageID),
+                    exportedAt: Date()
+                )
+            )
+            fileExtension = "md"
+        case .plainText:
+            content = TranscriptExporter.plainText(entries: entries)
+            fileExtension = "txt"
+        }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "v2s-transcript.\(fileExtension)"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? content.write(to: url, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Summarization

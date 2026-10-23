@@ -610,6 +610,14 @@ final class OverlayWindowController {
         }
     }
 
+    /// Default vertical origin: below the menu bar, or above the Dock when anchored to the bottom.
+    /// `visibleFrame` already excludes both.
+    private func defaultOriginY(in visibleFrame: NSRect, height: Double, style: OverlayStyle) -> Double {
+        style.anchorsToBottom
+            ? visibleFrame.minY + style.topInset
+            : visibleFrame.maxY - style.topInset - height
+    }
+
     private func positionPanels(animated: Bool = false) {
         guard let screen = currentScreen() else { return }
 
@@ -630,7 +638,7 @@ final class OverlayWindowController {
             if let topLeft = userDefinedTopLeft {
                 originY = topLeft.y - height
             } else {
-                originY = visibleFrame.maxY - style.topInset - height
+                originY = defaultOriginY(in: visibleFrame, height: height, style: style)
             }
 
             overlayFrame = NSRect(x: originX, y: originY, width: width, height: height)
@@ -646,7 +654,7 @@ final class OverlayWindowController {
                 originY = topLeft.y - height
             } else {
                 originX = visibleFrame.midX - (width / 2)
-                originY = visibleFrame.maxY - style.topInset - height
+                originY = defaultOriginY(in: visibleFrame, height: height, style: style)
             }
 
             overlayFrame = NSRect(x: originX, y: originY, width: width, height: height)

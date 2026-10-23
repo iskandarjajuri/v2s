@@ -8,6 +8,7 @@ import Speech
 
 private extension Logger {
     static let capture = Logger(subsystem: "com.franklioxygen.v2s", category: "capture")
+    static let appAudioCapture = Logger(subsystem: "com.franklioxygen.v2s", category: "appAudioCapture")
 }
 
 struct RecognizedSentence: Equatable, Sendable {
@@ -68,9 +69,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     private struct ApplicationCaptureDescriptor: Sendable {
-        let appName: String
+        let source: InputSource
         let processObjectIDs: [AudioObjectID]
-        let readStreamFailureMessage: String
     }
 
     @MainActor
@@ -171,16 +171,38 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var interfaceLanguageID = "en"
     private var modernAnalyzerTask: Task<Void, Never>?
     private var modernResultsTask: Task<Void, Never>?
-    private var lastModernCommittedResultIdentity: String?
+    private var modernResultLedger = TranscriberResultLedger()
+    /// Latest volatile SpeechTranscriber.Result, which supplies draft confidence and
+    /// timing when a commit changes the draft without a volatile result of its own.
+    private var latestModernVolatileResult: Any?
+    /// Latest sentence boundary the transcriber was asked to finalize through.
+    private var modernFinalizationRequestedThrough: CMTime?
     private var speechAnalyzerState: AnyObject?
     private var speechTranscriberState: AnyObject?
     private var analyzerInputContinuationState: Any?
     private var analyzerInputFormat: AVAudioFormat?
-    private var latestModernText = ""
-    private var modernCommittedPrefixText = ""
+
+    // MARK: Punctuation-aware segmentation (captureQueue)
+    private var segmentation: SegmentationSettings = .default
+    /// The audio time a leading sentence ends at, and since when the cut there has been unchanged.
+    private var finalizationCandidate: (boundary: CMTime, since: Date)?
+    private var finalizationRecheckTimer: DispatchSourceTimer?
 
     private var microphoneCaptureSession: AVCaptureSession?
     private var applicationAudioCapture: ApplicationAudioCapture?
+
+    // MARK: App audio capture recovery (captureQueue)
+    /// The app being captured. Nil for a microphone source and once the session stops.
+    private var applicationCaptureSource: InputSource?
+    /// Identifies the current capture. Events and rebuilds that belong to an earlier one
+    /// are dropped.
+    private var applicationCaptureGeneration = 0
+    private var pendingApplicationCaptureRebuild: DispatchWorkItem?
+    private var applicationCaptureRebuildSchedule = ApplicationCaptureRebuildSchedule()
+    private var applicationCaptureRecovery = ApplicationCaptureRecoveryPolicy()
+    /// A route change arrives as a burst of notifications; one rebuild answers them all.
+    private let applicationCaptureRebuildDebounce: TimeInterval = 0.3
+    private let applicationProcessRefreshDebounce: TimeInterval = 1
 
     private var transcriptHandler: (@MainActor (RecognizedSentence) -> Void)?
     private var partialHandler: (@MainActor (DraftSegment?) -> Void)?
@@ -255,7 +277,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     private var lastMeterPublishTime = Date.distantPast
     // アプリ音声のときだけ設定する。watchdog がプロセス集合を解決し直すのに使う。
     private var activeApplicationSource: InputSource?
-    private var activeApplicationCaptureDescriptor: ApplicationCaptureDescriptor?
     private var watchdogTimer: DispatchSourceTimer?
     // 書き込みは start() で一度きり（watchdog を captureQueue に積む前）。以後は captureQueue 上で読むのみ。
     private var stallHandler: (@MainActor (CaptureHealthVerdict) -> Void)?
@@ -289,6 +310,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         localeIdentifier: String,
         interfaceLanguageID: String,
         modeConfig: ModeConfig = .balanced,
+        segmentation: SegmentationSettings = .default,
         contextualStrings: [String] = [],
         transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
         partialHandler: @escaping @MainActor (DraftSegment?) -> Void,
@@ -301,6 +323,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         self.transcriptHandler = transcriptHandler
         self.partialHandler = partialHandler
         self.modeConfig = modeConfig
+        self.segmentation = segmentation.clamped
         self.recognitionContextualStrings = sanitizeContextualStrings(contextualStrings)
         self.activeLocaleIdentifier = localeIdentifier
         self.interfaceLanguageID = interfaceLanguageID
@@ -332,7 +355,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             }
             try await runOnCaptureQueue {
                 self.activeApplicationSource = source
-                self.activeApplicationCaptureDescriptor = captureDescriptor
                 try self.startApplicationAudioCapture(descriptor: captureDescriptor)
             }
         }
@@ -401,14 +423,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         if let processSnapshot, processSnapshot.isEmpty == false {
             sourceIsRenderingAudio = processSnapshot.contains(where: \.isRunningOutput)
-            let resolvedIDs = processSnapshot.map(\.objectID)
-            if let descriptor = activeApplicationCaptureDescriptor,
-               Set(resolvedIDs) != Set(descriptor.processObjectIDs) {
-                Logger.capture.notice(
-                    "Tapped process set changed (\(descriptor.processObjectIDs.count, privacy: .public) -> \(resolvedIDs.count, privacy: .public)); rebuilding capture"
-                )
-                rebuildApplicationCapture(processObjectIDs: resolvedIDs, countsAsSilentRebuild: false)
-            }
         }
 
         if now.timeIntervalSince(lastAudioBufferTime) > 1 {
@@ -440,11 +454,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             break
         case .rebuildCapture:
             Logger.capture.warning("Capture unhealthy (\(String(describing: verdict), privacy: .public)); rebuilding tap")
-            let ids = processSnapshot?.map(\.objectID) ?? activeApplicationCaptureDescriptor?.processObjectIDs ?? []
-            rebuildApplicationCapture(
-                processObjectIDs: ids,
-                countsAsSilentRebuild: verdict == .captureSilent
-            )
+            let now = Date()
+            captureBuildTime = now
+            lastAudioBufferTime = now
+            if verdict == .captureSilent {
+                consecutiveSilentRebuilds += 1
+            }
+            scheduleApplicationCaptureRebuild(after: applicationCaptureRebuildDebounce, onlyIfProcessesChanged: false)
         case .reportPermissionProblem:
             Logger.capture.error("Capture stays silent while the source is playing; System Audio Recording permission is likely missing")
             permissionProblemReported = true
@@ -467,41 +483,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 isRebuilding: action == .rebuildCapture
             )
         )
-    }
-
-    /// タップと集約デバイスだけを作り直す。認識器・VAD・下書き状態はそのまま残すので、
-    /// 字幕の流れを切らずに音の経路だけを復旧できる。
-    private func rebuildApplicationCapture(processObjectIDs: [AudioObjectID], countsAsSilentRebuild: Bool) {
-        guard let descriptor = activeApplicationCaptureDescriptor, processObjectIDs.isEmpty == false else {
-            return
-        }
-
-        isRebuildingCapture = true
-        defer { isRebuildingCapture = false }
-
-        applicationAudioCapture?.stop()
-        applicationAudioCapture = nil
-
-        let rebuiltDescriptor = ApplicationCaptureDescriptor(
-            appName: descriptor.appName,
-            processObjectIDs: processObjectIDs,
-            readStreamFailureMessage: descriptor.readStreamFailureMessage
-        )
-        activeApplicationCaptureDescriptor = rebuiltDescriptor
-
-        let now = Date()
-        captureBuildTime = now
-        lastAudioBufferTime = now
-        if countsAsSilentRebuild {
-            consecutiveSilentRebuilds += 1
-        }
-
-        do {
-            try startApplicationAudioCapture(descriptor: rebuiltDescriptor)
-        } catch {
-            // 次の tick で audioStarved として再試行される。
-            Logger.capture.error("Capture rebuild failed: \(error.localizedDescription, privacy: .public)")
-        }
     }
 
     private func publishHealthStatus(_ status: CaptureHealthStatus) {
@@ -560,8 +541,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
         applicationAudioCapture?.stop()
         applicationAudioCapture = nil
-        activeApplicationSource = nil
-        activeApplicationCaptureDescriptor = nil
+        resetApplicationCaptureRecovery()
 
         stopModernSpeechRecognizer()
         resetRecognitionFailureState()
@@ -578,7 +558,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         vadEngine = nil
         lastVADProbability = 0
 
-        resetModernTranscriptionState()
         partialHandler = nil
         resetDraftState()
         Task { @MainActor [weak self] in
@@ -649,7 +628,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         resetRecognitionFailureState()
         resetAudioProcessingState()
         resetLegacyTranscriptionState()
-        resetModernTranscriptionState()
         cancelSilenceTimer()
         resetDraftState()
 
@@ -688,6 +666,23 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         return supportedIdentifiers.contains(resolved.identifier) ? resolved : nil
     }
 
+    /// The transcriber a live session runs. Asset checks build theirs here too, so they
+    /// ask for the same configuration the session will use.
+    ///
+    /// A session runs two: one reporting volatile results for the draft line, and one
+    /// reporting only final results for the transcript. A transcriber that reported a
+    /// volatile result need not reissue it as final when finalization leaves it
+    /// unchanged, so only the final-only one is sure to deliver every final result.
+    @available(macOS 26.0, *)
+    static func makeSpeechTranscriber(locale: Locale, reportsVolatileResults: Bool = true) -> SpeechTranscriber {
+        SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: reportsVolatileResults ? [.volatileResults] : [],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+    }
+
     private func configureModernSpeechRecognizer(localeIdentifier: String) async throws -> Bool {
         guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else {
             return false
@@ -708,17 +703,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return false
         }
 
-        let transcriber = SpeechTranscriber(
-            locale: resolvedLocale,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
-        )
+        let transcriber = Self.makeSpeechTranscriber(locale: resolvedLocale)
+        let finalTranscriber = Self.makeSpeechTranscriber(locale: resolvedLocale, reportsVolatileResults: false)
+        let modules = [transcriber, finalTranscriber]
 
-        try await ensureSpeechAnalyzerAssetsIfNeeded(for: transcriber, locale: resolvedLocale)
+        try await ensureSpeechAnalyzerAssetsIfNeeded(for: modules, locale: resolvedLocale)
 
         let options = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .whileInUse)
-        let analyzer = SpeechAnalyzer(modules: [transcriber], options: options)
+        let analyzer = SpeechAnalyzer(modules: modules, options: options)
         let context = AnalysisContext()
         if recognitionContextualStrings.isEmpty == false {
             context.contextualStrings[.general] = recognitionContextualStrings
@@ -726,7 +718,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         try await analyzer.setContext(context)
 
         let preferredFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-            compatibleWith: [transcriber],
+            compatibleWith: modules,
             considering: processingFormat
         ) ?? processingFormat
         try await analyzer.prepareToAnalyze(in: preferredFormat)
@@ -738,10 +730,24 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         modernResultsTask?.cancel()
         modernResultsTask = Task { [weak self] in
             do {
-                for try await result in transcriber.results {
-                    self?.captureQueue.async { [weak self] in
-                        self?.processModernRecognitionResult(result)
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        for try await result in transcriber.results {
+                            self?.captureQueue.async { [weak self] in
+                                self?.processModernDraftResult(result)
+                            }
+                        }
                     }
+                    group.addTask {
+                        for try await result in finalTranscriber.results {
+                            self?.captureQueue.async { [weak self] in
+                                self?.processModernFinalResult(result)
+                            }
+                        }
+                    }
+                    // waitForAll would hold a failed stream's error until the other
+                    // stream ends. Rethrowing it here cancels the other one instead.
+                    while try await group.next() != nil {}
                 }
             } catch is CancellationError {
                 return
@@ -771,13 +777,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         audioConverter = nil
         audioConverterInputSignature = nil
         resetLegacyTranscriptionState()
-        resetModernTranscriptionState()
         cancelSilenceTimer()
         cancelVADSilenceTimer()
         resetDraftState()
-        lastModernCommittedResultIdentity = nil
+        modernResultLedger = TranscriberResultLedger()
+        latestModernVolatileResult = nil
+        modernFinalizationRequestedThrough = nil
 
-        // Initialize Silero VAD engine for draft confidence / silence scoring only.
+        // Silero VAD finds speech offsets, which ask the transcriber to finalize.
         do {
             vadEngine = try SileroVADEngine()
         } catch {
@@ -789,7 +796,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     @available(macOS 26.0, *)
     private func ensureSpeechAnalyzerAssetsIfNeeded(
-        for transcriber: SpeechTranscriber,
+        for modules: [SpeechTranscriber],
         locale: Locale
     ) async throws {
         let installedLocales = await Set(SpeechTranscriber.installedLocales.map(\.identifier))
@@ -797,7 +804,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             return
         }
 
-        if let installer = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        if let installer = try await AssetInventory.assetInstallationRequest(supporting: modules) {
             try await installer.downloadAndInstall()
         }
     }
@@ -807,11 +814,13 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         modernAnalyzerTask = nil
         modernResultsTask?.cancel()
         modernResultsTask = nil
-        lastModernCommittedResultIdentity = nil
+        modernResultLedger = TranscriberResultLedger()
+        latestModernVolatileResult = nil
+        modernFinalizationRequestedThrough = nil
+        cancelFinalizationRecheck()
         recognitionBackend = .legacy
         modernAudioConverter = nil
         modernAudioConverterInputSignature = nil
-        resetModernTranscriptionState()
 
         if #available(macOS 26.0, *) {
             (analyzerInputContinuationState as? AsyncStream<AnalyzerInput>.Continuation)?.finish()
@@ -837,6 +846,9 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 return
             }
 
+            // No finalized result will arrive for the draft the analyzer was revising,
+            // so it is the best text there is: commit it rather than drop it.
+            self.commitPendingModernDraft()
             self.stopModernSpeechRecognizer()
 
             do {
@@ -900,11 +912,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         highPassPreviousOutput = 0
     }
 
-    private func resetModernTranscriptionState() {
-        latestModernText = ""
-        modernCommittedPrefixText = ""
-    }
-
     private func resetLegacyTranscriptionState() {
         committedSegmentCount = 0
         committedAudioBoundaryTime = nil
@@ -946,31 +953,35 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     @MainActor
     private func makeApplicationCaptureDescriptor(for source: InputSource) throws -> ApplicationCaptureDescriptor {
         ApplicationCaptureDescriptor(
-            appName: source.name,
-            processObjectIDs: try resolveApplicationProcessObjectIDs(for: source),
-            readStreamFailureMessage: localized(.failedToReadCapturedAudioStreamFormat, source.name)
+            source: source,
+            processObjectIDs: try resolveApplicationProcessObjectIDs(for: source)
         )
     }
 
     private func startApplicationAudioCapture(descriptor: ApplicationCaptureDescriptor) throws {
+        applicationCaptureGeneration &+= 1
+        let generation = applicationCaptureGeneration
         let capture = ApplicationAudioCapture(
-            appName: descriptor.appName,
+            appName: descriptor.source.name,
             processObjectIDs: descriptor.processObjectIDs,
-            readStreamFailureMessage: descriptor.readStreamFailureMessage,
+            silenceWindow: applicationCaptureRecovery.silenceWindow,
             queue: captureQueue,
             audioHandler: { [weak self] buffer in
                 self?.append(audioBuffer: buffer)
             },
-            errorHandler: { [weak self] message in
-                Task {
-                    await self?.emitError(message)
-                }
+            eventHandler: { [weak self] event in
+                self?.handleApplicationCaptureEvent(event, generation: generation)
             }
         )
 
         do {
             try capture.start()
             applicationAudioCapture = capture
+            applicationCaptureSource = descriptor.source
+            // The descriptor predates tap creation. Process changes during creation or
+            // the listener gap between captures may never reach this generation, so
+            // always reconcile once the new listeners are installed.
+            scheduleApplicationCaptureRebuild(after: applicationProcessRefreshDebounce, onlyIfProcessesChanged: true)
         } catch let error as ApplicationAudioCapture.CaptureError {
             throw mapApplicationCaptureError(error)
         } catch {
@@ -982,6 +993,206 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
                 )
             )
         }
+    }
+
+    // MARK: App audio capture recovery
+
+    /// Handles a capture's report on the capture queue. A capture that stopped matching
+    /// its audio is replaced: the app's processes are resolved again, and a new tap and
+    /// aggregate device are built for them.
+    private func handleApplicationCaptureEvent(_ event: ApplicationCaptureEvent, generation: Int) {
+        guard generation == applicationCaptureGeneration, applicationCaptureSource != nil else {
+            return
+        }
+
+        switch event {
+        case .receivingAudio:
+            applicationCaptureRecovery.recordAudibleCapture()
+        case .processListChanged:
+            scheduleApplicationCaptureRebuild(after: applicationProcessRefreshDebounce, onlyIfProcessesChanged: true)
+        case .invalidated(let change):
+            Logger.appAudioCapture.notice("Rebuilding app audio capture: \(String(describing: change), privacy: .public)")
+
+            if change == .silentWhileAppIsPlaying {
+                applicationCaptureRecovery.recordSilentCapture()
+            }
+
+            scheduleApplicationCaptureRebuild(after: applicationCaptureRebuildDebounce, onlyIfProcessesChanged: false)
+        }
+    }
+
+    /// Queues a rebuild of the app capture. With `onlyIfProcessesChanged` the running
+    /// capture is kept unless the app's audio processes differ from the tapped ones.
+    private func scheduleApplicationCaptureRebuild(after delay: TimeInterval, onlyIfProcessesChanged: Bool) {
+        guard let request = applicationCaptureRebuildSchedule.schedule(onlyIfProcessesChanged: onlyIfProcessesChanged) else {
+            return
+        }
+        pendingApplicationCaptureRebuild?.cancel()
+
+        let generation = applicationCaptureGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.applicationCaptureRebuildSchedule.beginResolving(request) else {
+                return
+            }
+
+            self.pendingApplicationCaptureRebuild = nil
+            self.rebuildApplicationCapture(generation: generation, request: request)
+        }
+
+        pendingApplicationCaptureRebuild = work
+        captureQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func rebuildApplicationCapture(generation: Int, request: ApplicationCaptureRebuildSchedule.Request) {
+        guard generation == applicationCaptureGeneration, let source = applicationCaptureSource else {
+            // Release the reservation; a request left in place would block every later rebuild.
+            _ = applicationCaptureRebuildSchedule.finish(request)
+            return
+        }
+
+        // The app's processes are resolved on the main actor, as at start.
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let resolution: Result<ApplicationCaptureDescriptor, Error>
+            do {
+                resolution = .success(try await MainActor.run {
+                    try self.makeApplicationCaptureDescriptor(for: source)
+                })
+            } catch {
+                resolution = .failure(error)
+            }
+
+            self.captureQueue.async {
+                self.finishApplicationCaptureRebuild(
+                    resolution,
+                    generation: generation,
+                    request: request
+                )
+            }
+        }
+    }
+
+    private func finishApplicationCaptureRebuild(
+        _ resolution: Result<ApplicationCaptureDescriptor, Error>,
+        generation: Int,
+        request: ApplicationCaptureRebuildSchedule.Request
+    ) {
+        // Release the reservation before anything else, so no early return can leave it
+        // in place and block every later rebuild.
+        guard applicationCaptureRebuildSchedule.finish(request) else {
+            return
+        }
+        let needsFollowUpRefresh = applicationCaptureRebuildSchedule.takeFollowUpRefresh()
+
+        guard generation == applicationCaptureGeneration, applicationCaptureSource != nil else {
+            return
+        }
+        defer {
+            // A process that registered after this request's lookup still needs tapping.
+            if needsFollowUpRefresh, applicationCaptureSource != nil {
+                scheduleApplicationCaptureRebuild(after: applicationProcessRefreshDebounce, onlyIfProcessesChanged: true)
+            }
+        }
+        let onlyIfProcessesChanged = request.onlyIfProcessesChanged
+
+        let descriptor: ApplicationCaptureDescriptor
+        switch resolution {
+        case .success(let resolved):
+            descriptor = resolved
+        case .failure(let error):
+            // A closed app cannot recover through the watchdog: none of its old
+            // processes will report output again. Surface the specific error now.
+            if case SessionError.missingApplication = error {
+                abandonApplicationCapture(after: error)
+                return
+            }
+            // Keep a working capture through transient process-list churn.
+            if onlyIfProcessesChanged, applicationAudioCapture != nil {
+                return
+            }
+
+            retryApplicationCaptureRebuild(after: error)
+            return
+        }
+
+        if onlyIfProcessesChanged,
+           let capture = applicationAudioCapture,
+           Set(capture.processObjectIDs) == Set(descriptor.processObjectIDs) {
+            return
+        }
+
+        // Count actual replacements, including process changes, rather than just
+        // invalidation events. Helper churn must not bypass the rebuild limit.
+        let rebuildKind: ApplicationCaptureRecoveryPolicy.RebuildKind = onlyIfProcessesChanged ? .processChange : .recovery
+        if let delay = applicationCaptureRecovery.admitRebuild(rebuildKind, at: ProcessInfo.processInfo.systemUptime) {
+            guard onlyIfProcessesChanged, applicationAudioCapture != nil else {
+                abandonApplicationCapture(after: nil)
+                return
+            }
+
+            // The running capture still works, so churn must not end the session. Tap
+            // the changed processes once the window has room again.
+            Logger.appAudioCapture.notice("Deferring app audio process refresh by \(delay, privacy: .public) s")
+            scheduleApplicationCaptureRebuild(after: delay, onlyIfProcessesChanged: true)
+            return
+        }
+
+        applicationAudioCapture?.stop()
+        applicationAudioCapture = nil
+
+        do {
+            try startApplicationAudioCapture(descriptor: descriptor)
+            applicationCaptureRecovery.recordSuccessfulRebuild()
+        } catch {
+            retryApplicationCaptureRebuild(after: error)
+        }
+    }
+
+    private func retryApplicationCaptureRebuild(after error: Error) {
+        Logger.appAudioCapture.error("App audio capture rebuild failed: \(self.localizedErrorDescription(error))")
+
+        guard let delay = applicationCaptureRecovery.delayAfterFailedRebuild() else {
+            abandonApplicationCapture(after: error)
+            return
+        }
+
+        scheduleApplicationCaptureRebuild(after: delay, onlyIfProcessesChanged: false)
+    }
+
+    /// Ends the session once the app's audio cannot be recovered, and tells the user
+    /// how to get it back.
+    private func abandonApplicationCapture(after error: Error?) {
+        let appName = applicationCaptureSource?.name ?? ""
+        var message = localized(.applicationAudioLostFormat, appName)
+
+        if let error = error as? SessionError {
+            switch error {
+            case .audioCapturePermissionDenied, .missingApplication:
+                // These already tell the user what to do.
+                message = localizedErrorDescription(error)
+            default:
+                break
+            }
+        }
+
+        Logger.appAudioCapture.error("Gave up on app audio capture for \(appName)")
+        stopOnCaptureQueue()
+
+        Task {
+            await self.emitFatalError(message)
+        }
+    }
+
+    private func resetApplicationCaptureRecovery() {
+        pendingApplicationCaptureRebuild?.cancel()
+        pendingApplicationCaptureRebuild = nil
+        applicationCaptureRebuildSchedule.cancel()
+        applicationCaptureSource = nil
+        applicationCaptureGeneration &+= 1
+        applicationCaptureRecovery = ApplicationCaptureRecoveryPolicy()
     }
 
     private func resolveApplicationProcessObjectIDs(for source: InputSource) throws -> [AudioObjectID] {
@@ -1000,8 +1211,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         var seen = Set<AudioObjectID>()
 
         for process in audioProcesses {
+            // Process-list notifications can race an unrelated process exiting.
             guard let processID = try? process.pid else {
-                // 列挙中に終了したプロセス。
                 continue
             }
             let processObjectID = process.id
@@ -1198,7 +1409,7 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
 
     private func prepareProcessingBuffer(from audioBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         if audioBuffer.format.matches(processingFormat) {
-            guard let copiedBuffer = copyPCMBuffer(audioBuffer) else {
+            guard let copiedBuffer = audioBuffer.copied() else {
                 Task {
                     await emitError(localized(.failedToCopyCapturedAudioForSpeechPreprocessing))
                 }
@@ -1337,27 +1548,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         @unknown default:
             return nil
         }
-    }
-
-    private func copyPCMBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: source.frameLength) else {
-            return nil
-        }
-
-        copy.frameLength = source.frameLength
-        let sourceBuffers = UnsafeMutableAudioBufferListPointer(source.mutableAudioBufferList)
-        let destinationBuffers = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
-
-        for (sourceBuffer, destinationBuffer) in zip(sourceBuffers, destinationBuffers) {
-            guard let sourceData = sourceBuffer.mData,
-                  let destinationData = destinationBuffer.mData else {
-                continue
-            }
-
-            memcpy(destinationData, sourceData, Int(sourceBuffer.mDataByteSize))
-        }
-
-        return copy
     }
 
     private func cleanUpSpeechBuffer(_ buffer: AVAudioPCMBuffer) -> AudioLevelStats {
@@ -1754,77 +1944,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         SentenceBoundaryHeuristics.sentenceRanges(in: text)
     }
 
-    private func pendingModernText(from fullText: String) -> String {
-        guard modernCommittedPrefixText.isEmpty == false else {
-            return fullText
-        }
-        if fullText.hasPrefix(modernCommittedPrefixText) {
-            return String(fullText.dropFirst(modernCommittedPrefixText.count))
-        }
-
-        let committedSentences = splitRecognizedSentences(in: modernCommittedPrefixText)
-        let nsFullText = fullText as NSString
-        let fullSentenceRanges = sentenceRanges(in: nsFullText)
-        let fullSentences = fullSentenceRanges.map {
-            nsFullText.substring(with: $0).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        guard committedSentences.isEmpty == false,
-              fullSentences.isEmpty == false else {
-            return fullText
-        }
-
-        let committedComparable = committedSentences.map(comparableCommittedSentenceText)
-        let fullComparable = fullSentences.map(comparableCommittedSentenceText)
-        let maxOverlap = min(committedComparable.count, fullComparable.count)
-
-        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
-            if Array(committedComparable.suffix(overlap)) == Array(fullComparable.prefix(overlap)) {
-                let matchedRange = fullSentenceRanges[overlap - 1]
-                let nextLocation = matchedRange.location + matchedRange.length
-                guard nextLocation < nsFullText.length else {
-                    return ""
-                }
-
-                return nsFullText.substring(from: nextLocation)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-
-        return fullText
-    }
-
-    private func committableModernText(in rawText: String) -> (committedRawText: String, remainingRawText: String)? {
-        let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmedText.isEmpty == false else {
-            return nil
-        }
-
-        let nsText = rawText as NSString
-        let sentenceRanges = sentenceRanges(in: nsText)
-        guard sentenceRanges.isEmpty == false else {
-            return nil
-        }
-
-        if SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: trimmedText) {
-            return (rawText, "")
-        }
-
-        guard sentenceRanges.count >= 2,
-              let trailingSentenceRange = sentenceRanges.last,
-              trailingSentenceRange.location > 0 else {
-            return nil
-        }
-
-        let committedRawText = nsText.substring(to: trailingSentenceRange.location)
-        let remainingRawText = nsText.substring(from: trailingSentenceRange.location)
-        guard committedRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-            return nil
-        }
-
-        return (committedRawText, remainingRawText)
-    }
-
     private func hasLikelyPunctuationBoundary(
         afterSegmentAt index: Int,
         in formattedText: NSString,
@@ -2032,7 +2151,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         // Reset the converter — new request may have a different nativeAudioFormat.
         resetAudioProcessingState()
         resetLegacyTranscriptionState()
-        resetModernTranscriptionState()
         resetDraftState()
         Task { await emitPartialDraft(nil) }
     }
@@ -2151,87 +2269,313 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Takes a result from the transcriber that reports volatile results. Its text drives
+    /// the draft line only, even when final: finalization that leaves a volatile result
+    /// unchanged need not reissue it, so this transcriber cannot be relied on for every
+    /// final result. The final-only transcriber's results are committed instead.
     @available(macOS 26.0, *)
-    private func processModernRecognitionResult(_ result: SpeechTranscriber.Result) {
-        let now = Date()
-        lastRecognitionResultTime = now
-        lastRecognizerOutputTime = now
-        let fullText = normalizedTranscriberText(result.text)
-        let pendingRawText = pendingModernText(from: fullText)
-        let text = pendingRawText.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func processModernDraftResult(_ result: SpeechTranscriber.Result) {
+        // A result already in flight when the analyzer failed over must not reach the
+        // legacy recognizer's draft state.
+        guard recognitionBackend == .speechAnalyzer else { return }
 
-        if result.isFinal {
-            let identity = modernResultIdentity(for: result)
-            guard identity != lastModernCommittedResultIdentity else { return }
-            lastModernCommittedResultIdentity = identity
+        if result.isFinal == false {
+            latestModernVolatileResult = result
+        }
+        modernResultLedger.applyDraft(Self.transcriberPieces(of: result), range: result.range)
+        publishModernTranscript(finalizedText: nil)
 
-            cancelSilenceTimer()
-            cancelVADSilenceTimer()
-            resetModernTranscriptionState()
-            let committedDraftID = currentDraftId
+        if result.isFinal == false {
+            finalizeCompletedSentencesInLongDraft(result)
+        }
+    }
+
+    /// Commits a result from the final-only transcriber. Volatile results are interim
+    /// guesses the transcriber keeps revising, so pauses and long drafts ask the analyzer
+    /// to finalize, and the text arrives here.
+    @available(macOS 26.0, *)
+    private func processModernFinalResult(_ result: SpeechTranscriber.Result) {
+        guard recognitionBackend == .speechAnalyzer else { return }
+
+        let finalizedText = modernResultLedger.commit(
+            Self.transcriberPieces(of: result),
+            range: result.range,
+            resultsFinalizationTime: result.resultsFinalizationTime
+        )
+        publishModernTranscript(finalizedText: finalizedText)
+    }
+
+    @available(macOS 26.0, *)
+    private static func transcriberPieces(of result: SpeechTranscriber.Result) -> [TranscriberResultLedger.Piece] {
+        let runs = result.text.runs.map { run in
+            (text: String(result.text[run.range].characters), audioRange: run.audioTimeRange)
+        }
+        return TranscriberResultLedger.pieces(from: runs, resultRange: result.range)
+    }
+
+    /// Commits final text and shows the draft that remains.
+    @available(macOS 26.0, *)
+    private func publishModernTranscript(finalizedText: String?) {
+        let draftText = modernResultLedger.draftText
+        let draftChanged = draftText != lastDraftText
+        let committedDraftID = currentDraftId
+        if finalizedText != nil {
             resetDraftState()
-
-            if text.isEmpty == false {
-                Task {
-                    await emitCommittedSequence(
-                        [
-                            CommittedEmission(
-                                text: text,
-                                promotionSegmentID: committedDraftID
-                            )
-                        ],
-                        clearDraftAfter: true
-                    )
-                }
-            } else {
-                Task { await emitPartialDraft(nil) }
-            }
-            return
         }
 
-        guard text.isEmpty == false else {
-            latestModernText = ""
+        if draftText.isEmpty {
+            // Nothing is left for the inactivity timer to finalize. Left running, it
+            // could finalize the next utterance before its first result arrives.
             cancelSilenceTimer()
-            cancelVADSilenceTimer()
-            Task { await emitPartialDraft(nil) }
-            return
+        } else if let result = latestModernVolatileResult as? SpeechTranscriber.Result {
+            emitDraftUpdate(from: result, text: draftText)
+
+            // Re-armed only when the draft moves: a transcriber that repeats the same
+            // volatile text through a pause, or stops hearing audio, still finalizes it.
+            if draftChanged || finalizedText != nil {
+                scheduleSilenceCommit()
+            }
         }
 
-        observeDraftText(text, at: now)
-        latestModernText = pendingRawText
-        if let split = committableModernText(in: pendingRawText),
-           split.remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: text),
-           canFastCommitModernBoundary(at: now) {
-            let committedText = split.committedRawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard committedText.isEmpty == false else {
-                latestModernText = ""
-                Task { await emitPartialDraft(nil) }
-                return
-            }
-
-            cancelSilenceTimer()
-            cancelVADSilenceTimer()
-            modernCommittedPrefixText += split.committedRawText
-            latestModernText = split.remainingRawText
-            let committedDraftID = currentDraftId
-            resetDraftState()
+        if let finalizedText {
             Task {
                 await emitCommittedSequence(
                     [
                         CommittedEmission(
-                            text: committedText,
+                            text: finalizedText,
                             promotionSegmentID: committedDraftID
                         )
                     ],
-                    clearDraftAfter: true
+                    clearDraftAfter: draftText.isEmpty
                 )
             }
+        } else if draftText.isEmpty {
+            Task { await emitPartialDraft(nil) }
+        }
+    }
+
+    /// Continuous speech never pauses long enough for the timers, so a long draft
+    /// finalizes its completed sentences and keeps only the unfinished tail volatile.
+    @available(macOS 26.0, *)
+    private func finalizeCompletedSentencesInLongDraft(_ result: SpeechTranscriber.Result) {
+        let boundary: CMTime
+        if segmentation.isEnabled {
+            // The leading part must stay unchanged for a moment, so a sentence the recognizer is
+            // still revising is not cut early. The recheck covers a recognizer that goes quiet.
+            guard let candidate = segmentationBoundary(in: result) else {
+                cancelFinalizationRecheck()
+                return
+            }
+            let now = Date()
+            let since: Date
+            if let existing = finalizationCandidate, CMTimeCompare(existing.boundary, candidate) == 0 {
+                since = existing.since
+            } else {
+                since = now
+                finalizationCandidate = (candidate, now)
+            }
+            let stableMs = Int(now.timeIntervalSince(since) * 1000)
+            guard stableMs >= segmentation.stableLeadingMs else {
+                scheduleFinalizationRecheck(afterMs: segmentation.stableLeadingMs - stableMs)
+                return
+            }
+            boundary = candidate
+        } else {
+            guard CMTimeGetSeconds(result.range.duration) >= modeConfig.maxChunkAudioSec,
+                  let candidate = completedSentenceBoundary(in: result.text) else {
+                return
+            }
+            boundary = candidate
+        }
+
+        if let requested = modernFinalizationRequestedThrough,
+           CMTimeCompare(boundary, requested) <= 0 {
+            return
+        }
+        modernFinalizationRequestedThrough = boundary
+        requestModernFinalization(through: boundary)
+    }
+
+    /// Asks the transcribers to finalize their volatile results through `time`, or through
+    /// all audio taken so far when `time` is nil. The final-only transcriber then delivers
+    /// the text as final results, whether or not finalization changed it.
+    private func requestModernFinalization(through time: CMTime?) {
+        guard #available(macOS 26.0, *),
+              recognitionBackend == .speechAnalyzer,
+              let analyzer = speechAnalyzerState as? SpeechAnalyzer else {
             return
         }
 
-        emitDraftUpdate(from: result, text: text)
-        scheduleSilenceCommit()
+        Task { [weak self] in
+            do {
+                try await analyzer.finalize(through: time)
+            } catch {
+                // A failed long-draft request must not block the next request for the
+                // same boundary, so the next long result can ask again.
+                guard let time else { return }
+                self?.captureQueue.async { [weak self] in
+                    guard let self,
+                          let requested = self.modernFinalizationRequestedThrough,
+                          CMTimeCompare(requested, time) == 0 else {
+                        return
+                    }
+                    self.modernFinalizationRequestedThrough = nil
+                }
+            }
+        }
+    }
+
+    /// Commits the current SpeechAnalyzer draft as it stands. Only for when the analyzer
+    /// is going away, since no finalized result will follow for it.
+    private func commitPendingModernDraft() {
+        let text = modernResultLedger.removePending()
+        let committedDraftID = currentDraftId
+        resetDraftState()
+
+        guard text.isEmpty == false else {
+            Task { await emitPartialDraft(nil) }
+            return
+        }
+
+        Task {
+            await emitCommittedSequence(
+                [
+                    CommittedEmission(
+                        text: text,
+                        promotionSegmentID: committedDraftID
+                    )
+                ],
+                clearDraftAfter: true
+            )
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private func completedSentenceBoundary(in text: AttributedString) -> CMTime? {
+        let runs = text.runs.map { run in
+            (text: String(text[run.range].characters), audioEnd: run.audioTimeRange?.end)
+        }
+        return Self.completedSentenceBoundary(in: runs)
+    }
+
+    /// Returns the audio time at which the last completed sentence ends, when more
+    /// speech follows it. Nil when the text holds no complete sentence, or nothing
+    /// after its last one.
+    static func completedSentenceBoundary(in runs: [(text: String, audioEnd: CMTime?)]) -> CMTime? {
+        var prefix = ""
+        var lastAudioEnd: CMTime?
+        var boundary: CMTime?
+        var hasSpeechAfterBoundary = false
+
+        for (index, run) in runs.enumerated() {
+            prefix += run.text
+            if let audioEnd = run.audioEnd, audioEnd.isNumeric {
+                lastAudioEnd = audioEnd
+            }
+            guard run.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                continue
+            }
+
+            let nextText = runs.dropFirst(index + 1)
+                .first { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }?
+                .text
+            if let lastAudioEnd,
+               SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: prefix, followedBy: nextText) {
+                boundary = lastAudioEnd
+                hasSpeechAfterBoundary = false
+            } else {
+                hasSpeechAfterBoundary = true
+            }
+        }
+
+        return hasSpeechAfterBoundary ? boundary : nil
+    }
+
+    /// Whether a speech offset should leave the draft volatile. A draft that ends on a
+    /// conjunction, particle or abbreviation is likely mid-sentence, and finalizing it
+    /// would split the caption at a breath pause. The inactivity timer still finalizes
+    /// it if the pause lasts.
+    static func shouldDeferModernVADFinalization(of rawText: String, languageCode: String?) -> Bool {
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty == false,
+              SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: text) == false else {
+            return false
+        }
+
+        if SentenceBoundaryHeuristics.endsWithLikelyNonTerminalAbbreviation(in: text) {
+            return true
+        }
+
+        switch languageCode {
+        case "ja":
+            return modernVADDeferredJapaneseSuffixes.contains(where: { text.hasSuffix($0) })
+        case "en":
+            let normalized = " " + text.lowercased()
+            return modernVADDeferredEnglishSuffixes.contains(where: { normalized.hasSuffix($0) })
+        default:
+            return false
+        }
+    }
+
+    // MARK: - Punctuation-aware early finalization
+
+    private var segmentationLanguage: SegmentationLanguage {
+        switch activeHeuristicLanguage {
+        case .japanese: return .japanese
+        case .english: return .english
+        case .other: return .other
+        }
+    }
+
+    /// Where the draft may be cut now: the end of its finished leading sentences, or of a clause
+    /// once the run is long. The cut text is mapped back onto the recognizer's audio timeline.
+    @available(macOS 26.0, *)
+    private func segmentationBoundary(in result: SpeechTranscriber.Result) -> CMTime? {
+        let text = result.text
+        let runs = text.runs.map { run in
+            (text: String(text[run.range].characters), audioEnd: run.audioTimeRange?.end)
+        }
+        let full = runs.map(\.text).joined()
+        guard let cut = PunctuationSegmenter.plan(
+            pending: full,
+            language: segmentationLanguage,
+            pendingAgeSeconds: CMTimeGetSeconds(result.range.duration),
+            settings: segmentation
+        ) else {
+            return nil
+        }
+
+        let target = cut.committed.trimmingCharacters(in: .whitespacesAndNewlines).count
+        var seen = 0
+        var boundary: CMTime?
+        for run in runs {
+            seen += run.text.trimmingCharacters(in: .whitespacesAndNewlines).count
+            if let audioEnd = run.audioEnd, audioEnd.isNumeric {
+                boundary = audioEnd
+            }
+            if seen >= target { return boundary }
+        }
+        return nil
+    }
+
+    private func scheduleFinalizationRecheck(afterMs: Int) {
+        cancelFinalizationRecheck()
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now() + .milliseconds(max(afterMs, 10)))
+        timer.setEventHandler { [weak self] in
+            guard let self, #available(macOS 26.0, *),
+                  self.recognitionBackend == .speechAnalyzer,
+                  let result = self.latestModernVolatileResult as? SpeechTranscriber.Result else { return }
+            self.finalizeCompletedSentencesInLongDraft(result)
+        }
+        timer.resume()
+        finalizationRecheckTimer = timer
+    }
+
+    private func cancelFinalizationRecheck() {
+        finalizationRecheckTimer?.cancel()
+        finalizationRecheckTimer = nil
+        finalizationCandidate = nil
     }
 
     private func observeDraftText(_ text: String, at now: Date) {
@@ -2254,50 +2598,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         return (silenceMs, stabilityScore)
-    }
-
-    private func canFastCommitModernBoundary(at now: Date) -> Bool {
-        Int(now.timeIntervalSince(lastDraftTextChangeTime) * 1000) >= modernBoundaryCommitStabilityDelayMs
-    }
-
-    private func canVADCommitModernDraft(_ rawText: String, at now: Date) -> Bool {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.isEmpty == false else {
-            return false
-        }
-
-        guard shouldHoldModernVADCommit(for: text) == false else {
-            return false
-        }
-
-        let stableForMs = Int(now.timeIntervalSince(lastDraftTextChangeTime) * 1000)
-        let minimumStableMs = max(vadSilenceCommitDeadlineMs, 260)
-        guard stableForMs >= minimumStableMs else {
-            return false
-        }
-
-        let maxDraftLength = text.containsCJKCharacters ? 14 : 28
-        return text.count <= maxDraftLength
-    }
-
-    private func shouldHoldModernVADCommit(for text: String) -> Bool {
-        guard SentenceBoundaryHeuristics.endsWithLikelySentenceTerminator(in: text) == false else {
-            return false
-        }
-
-        if SentenceBoundaryHeuristics.endsWithLikelyNonTerminalAbbreviation(in: text) {
-            return true
-        }
-
-        switch activeHeuristicLanguage {
-        case .japanese:
-            return Self.modernVADDeferredJapaneseCommitSuffixes.contains(where: { text.hasSuffix($0) })
-        case .english:
-            let normalized = text.lowercased()
-            return Self.modernVADDeferredEnglishCommitSuffixes.contains(where: { normalized.hasSuffix($0) })
-        case .other:
-            return false
-        }
     }
 
     private var activeHeuristicLanguage: RecognitionHeuristicLanguage {
@@ -2368,13 +2668,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     }
 
     @available(macOS 26.0, *)
-    private func normalizedTranscriberText(_ text: AttributedString) -> String {
-        String(text.characters)
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    @available(macOS 26.0, *)
     private func transcriberAverageConfidence(_ text: AttributedString) -> Float {
         var total: Double = 0
         var count = 0
@@ -2399,13 +2692,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         }
 
         return nil
-    }
-
-    @available(macOS 26.0, *)
-    private func modernResultIdentity(for result: SpeechTranscriber.Result) -> String {
-        let startMs = cmTimeMilliseconds(result.range.start)
-        let durationMs = cmTimeMilliseconds(result.range.duration)
-        return "\(startMs):\(durationMs):\(normalizedTranscriberText(result.text))"
     }
 
     private func draftLengthFitScore(for text: String) -> Float {
@@ -2452,12 +2738,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         max(600, modeConfig.minSilenceCommitMs + 350)
     }
 
-    /// Require a short stable window before promoting a punctuation-ended partial.
-    /// This keeps the fast path responsive without freezing a still-revisable boundary.
-    private var modernBoundaryCommitStabilityDelayMs: Int {
-        max(160, min(modeConfig.minSilenceCommitMs, 240))
-    }
-
     private var vadSilenceCommitDeadlineMs: Int {
         max(280, modeConfig.minSilenceCommitMs)
     }
@@ -2474,8 +2754,8 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
     // MARK: - VAD-based silence commit
 
     /// Schedules a fast commit based on Silero VAD detecting speech offset.
-    /// Uses the mode's minSilenceCommitMs (100–200 ms) — much faster than the
-    /// ASR-inactivity timer (700+ ms).
+    /// Uses the mode's minSilenceCommitMs, floored at 280 ms (280–340 ms) — much faster
+    /// than the ASR-inactivity timer (600+ ms).
     private func scheduleVADSilenceCommit() {
         scheduleSilenceCommit(trigger: .vadOffset, afterMs: vadSilenceCommitDeadlineMs)
     }
@@ -2521,47 +2801,14 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
             vadSilenceCommitTimer = nil
         }
 
+        // SpeechAnalyzer commits only finalized results, so a pause asks the transcriber
+        // to finalize now instead of committing the volatile draft here.
         if recognitionBackend == .speechAnalyzer {
-            let committedRawText: String
-            let remainingRawText: String
-
-            switch trigger {
-            case .asrInactivity:
-                guard let split = committableModernText(in: latestModernText) else {
-                    return
-                }
-                committedRawText = split.committedRawText
-                remainingRawText = split.remainingRawText
-            case .vadOffset:
-                let now = Date()
-                guard canVADCommitModernDraft(latestModernText, at: now) else {
-                    return
-                }
-                committedRawText = latestModernText
-                remainingRawText = ""
-            }
-
-            let text = committedRawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard text.isEmpty == false else {
-                latestModernText = remainingRawText
+            if trigger == .vadOffset,
+               Self.shouldDeferModernVADFinalization(of: lastDraftText, languageCode: activeLanguageCode) {
                 return
             }
-
-            modernCommittedPrefixText += committedRawText
-            latestModernText = remainingRawText
-            let committedDraftID = currentDraftId
-            resetDraftState()
-            Task {
-                await emitCommittedSequence(
-                    [
-                        CommittedEmission(
-                            text: text,
-                            promotionSegmentID: committedDraftID
-                        )
-                    ],
-                    clearDraftAfter: remainingRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            }
+            requestModernFinalization(through: nil)
             return
         }
 
@@ -2782,8 +3029,6 @@ final class LiveTranscriptionSession: NSObject, @unchecked Sendable {
         switch error {
         case .permissionDenied:
             return .audioCapturePermissionDenied
-        case .missingOutputDevice:
-            return .failedToStartCapture(localized(.noOutputAudioDeviceForAppCapture))
         case .tapFormatUnavailable:
             return .failedToStartCapture(localized(.selectedAppAudioFormatCouldNotBePrepared))
         case .failed(let stage, let status):
@@ -2804,41 +3049,557 @@ extension LiveTranscriptionSession: AVCaptureAudioDataOutputSampleBufferDelegate
     }
 }
 
-private final class ApplicationAudioCapture {
+/// Turns the session's SpeechTranscriber results into committed text and a draft line.
+///
+/// A transcriber that reported a volatile result need not reissue it as final when
+/// finalization leaves it unchanged, so its own results cannot tell when its text is
+/// final. The session therefore runs a second transcriber on the same analyzer that
+/// reports only final results, which it always delivers. Those results are committed
+/// as they arrive. The first transcriber's results, final or not, only make up the
+/// draft, which drops the text a commit covers and keeps the rest.
+struct TranscriberResultLedger {
+    /// One run of transcribed text and the audio it covers.
+    struct Piece: Equatable {
+        let text: String
+        let range: CMTimeRange
+    }
+
+    /// How long committed text is kept for cutting it out of draft pieces that started
+    /// before the commit.
+    static let committedTextMemory = CMTime(seconds: 60, preferredTimescale: 1_000)
+
+    /// Draft text, one entry per result, in audio order.
+    private var pending: [[Piece]] = []
+    /// Text for audio before this time has been committed.
+    private(set) var committedThrough = CMTime.negativeInfinity
+    /// Recently committed text, word by word.
+    private var recentCommitted: [Piece] = []
+
+    /// The draft text as the draft line should read it.
+    var draftText: String {
+        Self.joined(pending.map(Self.text(of:)))
+    }
+
+    /// Takes a result from the transcriber that reports volatile results. It replaces
+    /// what the draft said about the same audio, and commits nothing.
+    mutating func applyDraft(_ pieces: [Piece], range: CMTimeRange) {
+        // Everything this result covers has been committed.
+        guard CMTimeCompare(range.end, committedThrough) > 0 else {
+            return
+        }
+
+        // A result replaces what earlier results said about the same audio; what they
+        // said about audio on either side of it still stands.
+        if CMTimeCompare(range.start, range.end) < 0 {
+            pending = pending
+                .flatMap { entry in
+                    [
+                        entry.filter { CMTimeCompare($0.range.end, range.start) <= 0 },
+                        entry.filter { CMTimeCompare($0.range.start, range.end) >= 0 }
+                    ]
+                }
+                .filter { $0.isEmpty == false }
+        }
+
+        let freshPieces = pieces.compactMap { uncommittedPart(of: $0) }
+        if Self.text(of: freshPieces).isEmpty == false {
+            pending.append(freshPieces)
+            pending.sort { CMTimeCompare($0[0].range.start, $1[0].range.start) < 0 }
+        }
+    }
+
+    /// Takes a result from the final-only transcriber and returns the text to commit.
+    mutating func commit(_ pieces: [Piece], range: CMTimeRange, resultsFinalizationTime: CMTime) -> String? {
+        // Everything this result covers has been committed: it repeats one already taken.
+        guard CMTimeCompare(range.end, committedThrough) > 0 else {
+            return nil
+        }
+
+        let freshPieces = pieces.filter { CMTimeCompare($0.range.end, committedThrough) > 0 }
+
+        // No final text will come for audio before the finalization time, so the draft
+        // keeps only what follows it.
+        var through = range.end
+        if resultsFinalizationTime.isNumeric {
+            through = CMTimeMaximum(through, resultsFinalizationTime)
+        }
+        committedThrough = through
+        recentCommitted += freshPieces
+        let forgetBefore = CMTimeSubtract(committedThrough, Self.committedTextMemory)
+        recentCommitted.removeAll { CMTimeCompare($0.range.end, forgetBefore) <= 0 }
+        pending = pending
+            .map { entry in entry.compactMap { uncommittedPart(of: $0) } }
+            .filter { $0.isEmpty == false }
+
+        let committedText = Self.text(of: freshPieces)
+        return committedText.isEmpty ? nil : committedText
+    }
+
+    /// The part of a draft piece that has not been committed, or nil when none is left.
+    ///
+    /// A volatile result is one piece for all its text, so a commit can cover only its
+    /// start, and the two transcribers can end the same words at slightly different
+    /// times. A piece that runs past the commit is cut after the words it shares with
+    /// the text committed for its audio.
+    private func uncommittedPart(of piece: Piece) -> Piece? {
+        if CMTimeCompare(piece.range.start, committedThrough) >= 0 {
+            return piece
+        }
+        if CMTimeCompare(piece.range.end, committedThrough) <= 0 {
+            return nil
+        }
+
+        // Committed words that lie mostly within the piece's committed audio.
+        let committedText = Self.text(of: recentCommitted.filter { committed in
+            let doubledMiddle = CMTimeAdd(committed.range.start, committed.range.end)
+            return CMTimeCompare(doubledMiddle, CMTimeMultiply(piece.range.start, multiplier: 2)) >= 0
+                && CMTimeCompare(doubledMiddle, CMTimeMultiply(committedThrough, multiplier: 2)) < 0
+        })
+        guard let tail = Self.text(of: piece.text, after: committedText) else {
+            return nil
+        }
+        return Piece(text: tail, range: CMTimeRange(start: committedThrough, end: piece.range.end))
+    }
+
+    /// What is left of `text` once the words it shares with `committedText` are cut
+    /// from its start, or nil when nothing is. Words are compared by their letters and
+    /// digits, each CJK character counting as a word, so case and punctuation changed
+    /// by finalization still match. Where words differ, the cut goes where `text`
+    /// matches `committedText` most closely, after as many words as it has.
+    static func text(of text: String, after committedText: String) -> String? {
+        let committedWords = comparableWords(in: committedText).map(\.word)
+        let words = comparableWords(in: text)
+        guard words.isEmpty == false else {
+            return nil
+        }
+
+        // distances[j]: edit distance between the committed words and the first j words.
+        var distances = Array(0...words.count)
+        for committedWord in committedWords {
+            var next = [distances[0] + 1]
+            for (j, word) in words.enumerated() {
+                next.append(min(
+                    distances[j] + (word.word == committedWord ? 0 : 1),
+                    distances[j + 1] + 1,
+                    next[j] + 1
+                ))
+            }
+            distances = next
+        }
+
+        let cut = distances.indices.min { lhs, rhs in
+            (distances[lhs], abs(lhs - committedWords.count)) < (distances[rhs], abs(rhs - committedWords.count))
+        } ?? 0
+        guard cut < words.count else {
+            return nil
+        }
+        return String(text[words[cut].start...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func comparableWords(in text: String) -> [(word: String, start: String.Index)] {
+        var words: [(word: String, start: String.Index)] = []
+        var word = ""
+        var wordStart = text.startIndex
+        for index in text.indices {
+            let character = text[index]
+            if String(character).containsCJKCharacters {
+                if word.isEmpty == false {
+                    words.append((word, wordStart))
+                    word = ""
+                }
+                words.append((String(character), index))
+            } else if character.isLetter || character.isNumber {
+                if word.isEmpty {
+                    wordStart = index
+                }
+                word += character.lowercased()
+            } else if word.isEmpty == false {
+                words.append((word, wordStart))
+                word = ""
+            }
+        }
+        if word.isEmpty == false {
+            words.append((word, wordStart))
+        }
+        return words
+    }
+
+    /// Drops the draft text and returns it.
+    mutating func removePending() -> String {
+        let text = draftText
+        pending.removeAll()
+        return text
+    }
+
+    /// Gives each run of a result an audio range. A run without one, often punctuation,
+    /// takes the range of the timed run before it, or of the first timed run when it
+    /// leads the text. Ranges are kept inside the result's own range.
+    static func pieces(
+        from runs: [(text: String, audioRange: CMTimeRange?)],
+        resultRange: CMTimeRange
+    ) -> [Piece] {
+        func timed(_ range: CMTimeRange?) -> CMTimeRange? {
+            guard let range, range.start.isNumeric, range.end.isNumeric else {
+                return nil
+            }
+            guard resultRange.start.isNumeric, resultRange.end.isNumeric else {
+                return range
+            }
+
+            let start = CMTimeMaximum(range.start, resultRange.start)
+            let end = CMTimeMaximum(CMTimeMinimum(range.end, resultRange.end), start)
+            return CMTimeRange(start: start, end: end)
+        }
+
+        var currentRange = runs.lazy.compactMap { timed($0.audioRange) }.first ?? resultRange
+        return runs.map { run in
+            if let range = timed(run.audioRange) {
+                currentRange = range
+            }
+            return Piece(text: run.text, range: currentRange)
+        }
+    }
+
+    private static func text(of pieces: [Piece]) -> String {
+        pieces.map(\.text).joined()
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Joins text from separate results, with a space between them unless either side
+    /// is CJK.
+    private static func joined(_ texts: [String]) -> String {
+        var joinedText = ""
+        for text in texts where text.isEmpty == false {
+            if let last = joinedText.last,
+               let first = text.first,
+               String(last).containsCJKCharacters == false,
+               String(first).containsCJKCharacters == false {
+                joinedText += " "
+            }
+            joinedText += text
+        }
+        return joinedText
+    }
+}
+
+/// Why an app-audio capture stopped delivering the audio it was built for. Each one
+/// makes the session tear the capture down and build it again.
+enum ApplicationCaptureChange: Equatable {
+    /// The tap or the aggregate device switched format, as when the app's Bluetooth
+    /// output drops into the hands-free profile.
+    case formatChanged
+    /// An IO cycle's buffer list no longer matches the tap's format.
+    case streamLayoutChanged
+    /// The private aggregate device went away.
+    case deviceDied
+    /// The system output route changed.
+    case defaultOutputChanged
+    /// No IO cycle arrived while the app was playing audio.
+    case stalled
+    /// Only digital silence arrived for the whole silence window while the app was
+    /// playing audio.
+    case silentWhileAppIsPlaying
+}
+
+enum ApplicationCaptureEvent: Equatable {
+    /// The capture no longer matches its audio and has to be rebuilt.
+    case invalidated(ApplicationCaptureChange)
+    /// Core Audio's process list changed, so the app may have started or stopped an
+    /// audio process.
+    case processListChanged
+    /// The first buffer carrying signal arrived.
+    case receivingAudio
+}
+
+/// Keeps a rebuild reserved through asynchronous process resolution. A route change
+/// supersedes a process refresh, and the superseded result cannot replace the capture.
+struct ApplicationCaptureRebuildSchedule {
+    struct Request: Equatable {
+        let id = UUID()
+        let onlyIfProcessesChanged: Bool
+    }
+
+    private(set) var current: Request?
+    /// The current request has started resolving the app's processes.
+    private var isResolving = false
+    /// A process-list change arrived while the current request was resolving, so its
+    /// snapshot of the app's processes may already be out of date.
+    private(set) var needsFollowUpRefresh = false
+
+    mutating func schedule(onlyIfProcessesChanged: Bool) -> Request? {
+        if let current, onlyIfProcessesChanged || !current.onlyIfProcessesChanged {
+            if onlyIfProcessesChanged, isResolving {
+                needsFollowUpRefresh = true
+            }
+            return nil
+        }
+        let request = Request(onlyIfProcessesChanged: onlyIfProcessesChanged)
+        current = request
+        // The new request resolves the processes itself, after this change.
+        isResolving = false
+        needsFollowUpRefresh = false
+        return request
+    }
+
+    /// Marks `request` as resolving. Returns false when a newer request superseded it.
+    mutating func beginResolving(_ request: Request) -> Bool {
+        guard current == request else {
+            return false
+        }
+        isResolving = true
+        return true
+    }
+
+    mutating func finish(_ request: Request) -> Bool {
+        guard current == request else {
+            return false
+        }
+        current = nil
+        isResolving = false
+        return true
+    }
+
+    /// Whether a refresh has to follow the request that just finished. Asking clears it.
+    mutating func takeFollowUpRefresh() -> Bool {
+        defer { needsFollowUpRefresh = false }
+        return needsFollowUpRefresh
+    }
+
+    mutating func cancel() {
+        current = nil
+        isResolving = false
+        needsFollowUpRefresh = false
+    }
+}
+
+/// Tracks IO health on the capture queue, including the active silence timeout.
+struct ApplicationCaptureHealth {
+    /// A playing app whose capture runs no IO cycle for this long has stalled.
+    static let stallTimeout: TimeInterval = 3
+
+    private(set) var silenceWindow: TimeInterval
+    private var lastIOCycleTime: TimeInterval = 0
+    private var lastSignalTime: TimeInterval = 0
+    private var hasReportedAudio = false
+
+    init(silenceWindow: TimeInterval) {
+        self.silenceWindow = silenceWindow
+    }
+
+    mutating func start(at time: TimeInterval) {
+        lastIOCycleTime = time
+        lastSignalTime = time
+    }
+
+    /// Returns true for the first audible cycle, which also resets session backoff.
+    mutating func recordCycle(at time: TimeInterval, hasSignal: Bool) -> Bool {
+        lastIOCycleTime = time
+        guard hasSignal else {
+            return false
+        }
+        lastSignalTime = time
+        silenceWindow = ApplicationCaptureRecoveryPolicy.silenceWindows[0]
+        defer { hasReportedAudio = true }
+        return !hasReportedAudio
+    }
+
+    mutating func check(at time: TimeInterval, isAppPlaying: Bool) -> ApplicationCaptureChange? {
+        guard isAppPlaying else {
+            start(at: time)
+            return nil
+        }
+        if time - lastIOCycleTime > Self.stallTimeout {
+            return .stalled
+        }
+        if time - lastSignalTime > silenceWindow {
+            return .silentWhileAppIsPlaying
+        }
+        return nil
+    }
+}
+
+/// Paces how an app-audio capture is rebuilt after it stops delivering audio.
+struct ApplicationCaptureRecoveryPolicy {
+    /// Delays before retrying a rebuild that failed. Once they run out the capture is
+    /// given up and the session reports it.
+    static let failedRebuildRetryDelays: [TimeInterval] = [0.5, 1, 2, 4]
+    /// How long a playing app may send only digital silence before the capture is
+    /// rebuilt. It grows while rebuilds keep coming back silent, so an app that holds its
+    /// output open without sound is not rebuilt every few seconds.
+    static let silenceWindows: [TimeInterval] = [8, 15, 30, 60]
+    /// More replacements of one kind than this within `rebuildWindow` are not converging.
+    static let maximumRebuildsPerWindow = 8
+    static let rebuildWindow: TimeInterval = 60
+
+    /// Why a capture is being replaced. Each kind has its own allowance, so helper
+    /// processes coming and going cannot use up the rebuilds a broken capture needs.
+    enum RebuildKind: Hashable {
+        /// The running capture stopped delivering its audio.
+        case recovery
+        /// The app's audio processes changed while the capture kept working.
+        case processChange
+    }
+
+    private(set) var consecutiveFailedRebuilds = 0
+    private(set) var consecutiveSilentCaptures = 0
+    private var recentRebuildTimes: [RebuildKind: [TimeInterval]] = [:]
+
+    var silenceWindow: TimeInterval {
+        Self.silenceWindows[min(consecutiveSilentCaptures, Self.silenceWindows.count - 1)]
+    }
+
+    /// Records a replacement of `kind` at `time`. Returns nil when it may go ahead, or
+    /// how long until the window has room for another one.
+    mutating func admitRebuild(_ kind: RebuildKind, at time: TimeInterval) -> TimeInterval? {
+        var times = recentRebuildTimes[kind, default: []].filter { time - $0 < Self.rebuildWindow }
+        defer { recentRebuildTimes[kind] = times }
+
+        if times.count >= Self.maximumRebuildsPerWindow, let oldest = times.first {
+            return oldest + Self.rebuildWindow - time
+        }
+
+        times.append(time)
+        return nil
+    }
+
+    /// Records a failed rebuild. Returns the delay before the next attempt, or nil once
+    /// the retries are exhausted.
+    mutating func delayAfterFailedRebuild() -> TimeInterval? {
+        guard consecutiveFailedRebuilds < Self.failedRebuildRetryDelays.count else {
+            return nil
+        }
+
+        let delay = Self.failedRebuildRetryDelays[consecutiveFailedRebuilds]
+        consecutiveFailedRebuilds += 1
+        return delay
+    }
+
+    mutating func recordSuccessfulRebuild() {
+        consecutiveFailedRebuilds = 0
+    }
+
+    mutating func recordSilentCapture() {
+        consecutiveSilentCaptures += 1
+    }
+
+    mutating func recordAudibleCapture() {
+        consecutiveSilentCaptures = 0
+    }
+}
+
+/// Checks the buffer lists an app-audio capture's IO cycle delivers.
+enum ApplicationCaptureBufferLayout {
+    /// Peaks at or below this (-120 dBFS) are digital silence. A tap that lost its
+    /// audio delivers exact zeros, while a live call's comfort noise sits far above it.
+    static let silenceThreshold: Float = 1e-6
+
+    /// Whether `buffers` holds exactly one non-empty stream in `format`. The aggregate
+    /// device carries only the tap, so any other layout means its configuration changed.
+    static func matches(_ buffers: UnsafeMutableAudioBufferListPointer, format: AVAudioFormat) -> Bool {
+        let expectedBufferCount = format.isInterleaved ? 1 : Int(format.channelCount)
+        let channelsPerBuffer = format.isInterleaved ? format.channelCount : 1
+        let bytesPerFrame = format.streamDescription.pointee.mBytesPerFrame
+
+        guard expectedBufferCount > 0,
+              buffers.count == expectedBufferCount,
+              bytesPerFrame > 0,
+              let byteSize = buffers.first?.mDataByteSize,
+              byteSize > 0,
+              byteSize % bytesPerFrame == 0 else {
+            return false
+        }
+
+        return buffers.allSatisfy {
+            $0.mData != nil && $0.mDataByteSize == byteSize && $0.mNumberChannels == channelsPerBuffer
+        }
+    }
+
+    /// Whether any Float32 sample rises above digital silence. Other sample formats are
+    /// assumed to carry signal, so they never read as a silent tap.
+    static func containsSignal(_ buffers: UnsafeMutableAudioBufferListPointer, format: AVAudioFormat) -> Bool {
+        guard format.commonFormat == .pcmFormatFloat32 else {
+            return true
+        }
+
+        for buffer in buffers {
+            guard let data = buffer.mData else {
+                continue
+            }
+
+            let samples = UnsafeBufferPointer(
+                start: data.assumingMemoryBound(to: Float.self),
+                count: Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+            )
+
+            if samples.contains(where: { abs($0) > silenceThreshold }) {
+                return true
+            }
+        }
+
+        return false
+    }
+}
+
+final class ApplicationAudioCapture {
     enum CaptureError: Error {
         case permissionDenied
-        case missingOutputDevice
         case tapFormatUnavailable
         case failed(stage: String, status: OSStatus)
     }
 
+    private struct PropertyListener {
+        let objectID: AudioObjectID
+        let address: AudioObjectPropertyAddress
+    }
+
+    private enum IOCycle {
+        case empty
+        case audio(AVAudioPCMBuffer, hasSignal: Bool)
+        /// The buffer list did not match the tap's format.
+        case unreadable
+    }
+
+    private static let healthCheckInterval: DispatchTimeInterval = .seconds(1)
+
+    let processObjectIDs: [AudioObjectID]
     private let appName: String
-    private let processObjectIDs: [AudioObjectID]
-    private let readStreamFailureMessage: String
     private let queue: DispatchQueue
+    private let ioQueue = DispatchQueue(label: "com.franklioxygen.v2s.capture.io", qos: .userInteractive)
     private let audioHandler: (AVAudioPCMBuffer) -> Void
-    private let errorHandler: (String) -> Void
+    private let eventHandler: (ApplicationCaptureEvent) -> Void
 
     private let system = AudioHardwareSystem.shared
     private var processTap: AudioHardwareTap?
     private var aggregateDevice: AudioHardwareAggregateDevice?
     private var deviceIOProcID: AudioDeviceIOProcID?
+    /// The tap's own format when the capture started.
     private var tapFormat: AVAudioFormat?
+    /// The format the IO cycle delivers: that of the aggregate device's tap stream.
+    private var streamFormat: AVAudioFormat?
+    private var propertyListeners: [PropertyListener] = []
+    private var propertyListenerToken: PropertyListenerRegistry.Token?
+    private var healthTimer: DispatchSourceTimer?
+
+    // Accessed only on `queue`, which also receives the IO cycles and property changes.
+    private var isRunning = false
+    private var hasReportedInvalidation = false
+    private var health: ApplicationCaptureHealth
 
     init(
         appName: String,
         processObjectIDs: [AudioObjectID],
-        readStreamFailureMessage: String,
+        silenceWindow: TimeInterval,
         queue: DispatchQueue,
         audioHandler: @escaping (AVAudioPCMBuffer) -> Void,
-        errorHandler: @escaping (String) -> Void
+        eventHandler: @escaping (ApplicationCaptureEvent) -> Void
     ) {
         self.appName = appName
         self.processObjectIDs = processObjectIDs
-        self.readStreamFailureMessage = readStreamFailureMessage
+        self.health = ApplicationCaptureHealth(silenceWindow: silenceWindow)
         self.queue = queue
         self.audioHandler = audioHandler
-        self.errorHandler = errorHandler
+        self.eventHandler = eventHandler
     }
 
     func start() throws {
@@ -2855,50 +3616,53 @@ private final class ApplicationAudioCapture {
 
             self.processTap = processTap
 
-            // まず出力デバイスを sub-device に持たない「タップだけ」の集約デバイスで組む。
-            // 出力デバイスを main sub-device に固定すると、Bluetooth ヘッドセットの接続・切断や
-            // 会議がマイクを開いた時の A2DP→HFP 切り替えで sub-device が古くなり、IOProc が
-            // 止まる（エラーは出ない）。タップだけでも IOProc が回ることは実機で確認済み。
-            // 念のため、組めない環境では従来どおり既定の出力デバイスを clock にして組み直す。
-            let tapUID = try processTap.uid
-            let aggregateDevice: AudioHardwareAggregateDevice
-            if let tapOnlyDevice = try? system.makeAggregateDevice(
-                description: Self.aggregateDescription(appName: appName, tapUID: tapUID, outputUID: nil)
-            ) {
-                aggregateDevice = tapOnlyDevice
-            } else {
-                guard let outputDevice = try system.defaultOutputDevice else {
-                    throw CaptureError.missingOutputDevice
-                }
-                guard let clockedDevice = try system.makeAggregateDevice(
-                    description: Self.aggregateDescription(appName: appName, tapUID: tapUID, outputUID: try outputDevice.uid)
-                ) else {
-                    throw CaptureError.failed(stage: "create the aggregate device", status: kAudioHardwareIllegalOperationError)
-                }
-                aggregateDevice = clockedDevice
+            // The aggregate device carries only the tap. With an output device as a
+            // sub-device, capture would depend on whichever device was the default output
+            // at start, and a headset's microphone would become an input stream in front
+            // of the tap. Running that microphone would also force a Bluetooth headset
+            // into its hands-free profile.
+            let aggregateDescription: [String: Any] = [
+                kAudioAggregateDeviceNameKey: "v2s-\(appName)",
+                kAudioAggregateDeviceUIDKey: UUID().uuidString,
+                kAudioAggregateDeviceIsPrivateKey: true,
+                kAudioAggregateDeviceIsStackedKey: false,
+                kAudioAggregateDeviceTapAutoStartKey: true,
+                kAudioAggregateDeviceTapListKey: [
+                    [
+                        kAudioSubTapDriftCompensationKey: true,
+                        kAudioSubTapUIDKey: try processTap.uid
+                    ]
+                ]
+            ]
+
+            guard let aggregateDevice = try system.makeAggregateDevice(description: aggregateDescription) else {
+                throw CaptureError.failed(stage: "create the aggregate device", status: kAudioHardwareIllegalOperationError)
             }
 
             self.aggregateDevice = aggregateDevice
 
-            var streamDescription = try processTap.format
-            guard let tapFormat = AVAudioFormat(streamDescription: &streamDescription) else {
+            var tapStreamDescription = try processTap.format
+            guard let tapFormat = AVAudioFormat(streamDescription: &tapStreamDescription) else {
                 throw CaptureError.tapFormatUnavailable
             }
 
             self.tapFormat = tapFormat
-            installTapFormatListener(tapID: processTap.id)
+            let streamFormat = Self.tapStreamFormat(of: aggregateDevice) ?? tapFormat
+            self.streamFormat = streamFormat
 
+            // The IO block gets its own queue. Core Audio holds the device's IO lock while
+            // the block runs, so running it on the capture queue would deadlock whenever
+            // the capture queue stops the device during an IO cycle.
             var deviceIOProcID: AudioDeviceIOProcID?
             let createIOProcStatus = AudioDeviceCreateIOProcIDWithBlock(
                 &deviceIOProcID,
                 aggregateDevice.id,
-                queue
-            ) { [weak self] _, inputData, _, _, _ in
-                guard let self else {
-                    return
+                ioQueue
+            ) { [weak self, queue] _, inputData, _, _, _ in
+                let cycle = Self.readIOCycle(inputData, format: streamFormat)
+                queue.async {
+                    self?.handleIOCycle(cycle)
                 }
-
-                self.handleCapturedAudio(inputData)
             }
 
             guard createIOProcStatus == noErr, let deviceIOProcID else {
@@ -2907,10 +3671,17 @@ private final class ApplicationAudioCapture {
 
             self.deviceIOProcID = deviceIOProcID
 
+            let now = Self.currentTime()
+            health.start(at: now)
+            isRunning = true
+
             let startStatus = AudioDeviceStart(aggregateDevice.id, deviceIOProcID)
             guard startStatus == noErr else {
                 throw CaptureError.failed(stage: "start app audio capture", status: startStatus)
             }
+
+            installPropertyListeners(tap: processTap, device: aggregateDevice)
+            startHealthChecks()
         } catch let error as AudioHardwareError {
             stop()
 
@@ -2926,6 +3697,12 @@ private final class ApplicationAudioCapture {
     }
 
     func stop() {
+        isRunning = false
+        healthTimer?.cancel()
+        healthTimer = nil
+        // Listeners go first: they are registered on the tap and the aggregate device.
+        removePropertyListeners()
+
         if let aggregateDevice, let deviceIOProcID {
             AudioDeviceStop(aggregateDevice.id, deviceIOProcID)
             AudioDeviceDestroyIOProcID(aggregateDevice.id, deviceIOProcID)
@@ -2939,7 +3716,6 @@ private final class ApplicationAudioCapture {
 
         aggregateDevice = nil
 
-        removeTapFormatListener()
 
         if let processTap {
             try? system.destroyProcessTap(processTap)
@@ -2947,89 +3723,268 @@ private final class ApplicationAudioCapture {
 
         processTap = nil
         tapFormat = nil
+        streamFormat = nil
     }
 
-    private static func aggregateDescription(appName: String, tapUID: String, outputUID: String?) -> [String: Any] {
-        var description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "v2s-\(appName)",
-            kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceTapListKey: [
-                [
-                    kAudioSubTapDriftCompensationKey: true,
-                    kAudioSubTapUIDKey: tapUID
-                ]
-            ]
-        ]
-        if let outputUID {
-            description[kAudioAggregateDeviceMainSubDeviceKey] = outputUID
-            description[kAudioAggregateDeviceSubDeviceListKey] = [
-                [
-                    kAudioSubDeviceUIDKey: outputUID
-                ]
-            ]
+    /// Reads one IO cycle on the IO queue. The buffer list is only valid during the
+    /// cycle, so the tap's samples are copied before they leave it.
+    private static func readIOCycle(_ inputData: UnsafePointer<AudioBufferList>, format: AVAudioFormat) -> IOCycle {
+        let mutableAudioBufferList = UnsafeMutablePointer<AudioBufferList>(mutating: inputData)
+        let buffers = UnsafeMutableAudioBufferListPointer(mutableAudioBufferList)
+        guard buffers.contains(where: { $0.mDataByteSize > 0 }) else {
+            return .empty
         }
-        return description
+
+        guard ApplicationCaptureBufferLayout.matches(buffers, format: format),
+              let buffer = AVAudioPCMBuffer(
+                  pcmFormat: format,
+                  bufferListNoCopy: mutableAudioBufferList,
+                  deallocator: nil
+              )?.copied() else {
+            return .unreadable
+        }
+
+        return .audio(buffer, hasSignal: ApplicationCaptureBufferLayout.containsSignal(buffers, format: format))
     }
 
-    private var tapFormatListener: (tapID: AudioObjectID, block: AudioObjectPropertyListenerBlock)?
+    private func handleIOCycle(_ cycle: IOCycle) {
+        guard isRunning else {
+            return
+        }
 
-    private static var tapFormatAddress: AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyFormat,
-            mScope: kAudioObjectPropertyScopeGlobal,
+        let now = Self.currentTime()
+        let hasSignal: Bool
+        if case .audio(_, let signal) = cycle {
+            hasSignal = signal
+        } else {
+            hasSignal = false
+        }
+        if health.recordCycle(at: now, hasSignal: hasSignal) {
+            eventHandler(.receivingAudio)
+        }
+
+        switch cycle {
+        case .empty:
+            break
+        case .unreadable:
+            invalidate(.streamLayoutChanged)
+        case .audio(let buffer, _):
+            audioHandler(buffer)
+        }
+    }
+
+    // MARK: Change detection
+
+    private func installPropertyListeners(tap: AudioHardwareTap, device: AudioHardwareAggregateDevice) {
+        // Core Audio notifies on its own thread; the change is handled on the capture
+        // queue, which owns all of this object's state.
+        propertyListenerToken = PropertyListenerRegistry.shared.register { [weak self, queue] selector in
+            queue.async {
+                self?.handlePropertyChange(selector)
+            }
+        }
+
+        addPropertyListener(tap.id, kAudioTapPropertyFormat)
+        addPropertyListener(device.id, kAudioDevicePropertyNominalSampleRate)
+        addPropertyListener(device.id, kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeInput)
+        addPropertyListener(device.id, kAudioDevicePropertyDeviceIsAlive)
+        addPropertyListener(system.id, kAudioHardwarePropertyDefaultOutputDevice)
+        addPropertyListener(system.id, kAudioHardwarePropertyProcessObjectList)
+    }
+
+    private func addPropertyListener(
+        _ objectID: AudioObjectID,
+        _ selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) {
+        guard let propertyListenerToken else {
+            return
+        }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
+        let status = AudioObjectAddPropertyListener(
+            objectID,
+            &address,
+            PropertyListenerRegistry.listenerProc,
+            propertyListenerToken.clientData
+        )
+        guard status == noErr else {
+            Logger.appAudioCapture.error(
+                "Could not watch property \(selector) of object \(objectID): \(status.readableDescription, privacy: .public)"
+            )
+            return
+        }
+
+        propertyListeners.append(PropertyListener(objectID: objectID, address: address))
     }
 
-    /// 出力先のサンプルレートが変わる（Bluetooth の HFP 切り替えで 48 kHz→16/24 kHz 等）と
-    /// タップの形式も変わる。開始時の形式のままバッファを包むと、再生速度のずれた音が認識器に
-    /// 渡ってしまうので、変更を購読して包む形式を差し替える。
-    private func installTapFormatListener(tapID: AudioObjectID) {
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            guard let self, let processTap = self.processTap,
-                  var streamDescription = try? processTap.format,
-                  let newFormat = AVAudioFormat(streamDescription: &streamDescription) else {
-                return
+    private func removePropertyListeners() {
+        guard let propertyListenerToken else {
+            return
+        }
+
+        for listener in propertyListeners {
+            var address = listener.address
+            AudioObjectRemovePropertyListener(
+                listener.objectID,
+                &address,
+                PropertyListenerRegistry.listenerProc,
+                propertyListenerToken.clientData
+            )
+        }
+
+        propertyListeners.removeAll()
+        // A notification already in flight finds no handler and is dropped.
+        PropertyListenerRegistry.shared.unregister(propertyListenerToken)
+        self.propertyListenerToken = nil
+    }
+
+    private func handlePropertyChange(_ selector: AudioObjectPropertySelector) {
+        guard isRunning else {
+            return
+        }
+
+        switch selector {
+        case kAudioHardwarePropertyProcessObjectList:
+            eventHandler(.processListChanged)
+        case kAudioHardwarePropertyDefaultOutputDevice:
+            invalidate(.defaultOutputChanged)
+        case kAudioDevicePropertyDeviceIsAlive:
+            if (try? aggregateDevice?.isAlive) != true {
+                invalidate(.deviceDied)
             }
-            self.tapFormat = newFormat
-        }
-        var address = Self.tapFormatAddress
-        if AudioObjectAddPropertyListenerBlock(tapID, &address, queue, block) == noErr {
-            tapFormatListener = (tapID, block)
+        default:
+            if formatChanged() {
+                invalidate(.formatChanged)
+            }
         }
     }
 
-    private func removeTapFormatListener() {
-        guard let tapFormatListener else {
-            return
+    /// Whether the tap, or the aggregate device's tap stream, now has a different format
+    /// from the one this capture was built with.
+    private func formatChanged() -> Bool {
+        guard let processTap, let aggregateDevice, let tapFormat, let streamFormat else {
+            return false
         }
-        var address = Self.tapFormatAddress
-        AudioObjectRemovePropertyListenerBlock(tapFormatListener.tapID, &address, queue, tapFormatListener.block)
-        self.tapFormatListener = nil
+
+        if var tapStreamDescription = try? processTap.format,
+           let currentTapFormat = AVAudioFormat(streamDescription: &tapStreamDescription),
+           currentTapFormat.matches(tapFormat) == false {
+            return true
+        }
+
+        if let currentStreamFormat = Self.tapStreamFormat(of: aggregateDevice),
+           currentStreamFormat.matches(streamFormat) == false {
+            return true
+        }
+
+        return false
     }
 
-    private func handleCapturedAudio(_ inputData: UnsafePointer<AudioBufferList>) {
-        guard let tapFormat,
-              inputData.pointee.mNumberBuffers > 0,
-              inputData.pointee.mBuffers.mDataByteSize > 0 else {
+    /// Catches failures that Core Audio sends no notification for. Stalls and silence
+    /// only count while the app is playing, since an idle app legitimately sends nothing.
+    private func startHealthChecks() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.healthCheckInterval, repeating: Self.healthCheckInterval)
+        timer.setEventHandler { [weak self] in
+            self?.checkHealth()
+        }
+        timer.resume()
+        healthTimer = timer
+    }
+
+    private func checkHealth() {
+        guard isRunning else {
             return
         }
 
-        let mutableAudioBufferList = UnsafeMutablePointer<AudioBufferList>(mutating: inputData)
+        if let change = health.check(at: Self.currentTime(), isAppPlaying: isAppPlaying()) {
+            invalidate(change)
+        }
+    }
 
-        guard let buffer = AVAudioPCMBuffer(
-            pcmFormat: tapFormat,
-            bufferListNoCopy: mutableAudioBufferList,
-            deallocator: nil
-        ) else {
-            errorHandler(readStreamFailureMessage)
+    private func isAppPlaying() -> Bool {
+        processObjectIDs.contains { (try? AudioHardwareProcess(id: $0).isRunningOutput) == true }
+    }
+
+    /// Reports the first change only: the session replaces this capture in response.
+    private func invalidate(_ change: ApplicationCaptureChange) {
+        guard isRunning, hasReportedInvalidation == false else {
             return
         }
 
-        audioHandler(buffer)
+        hasReportedInvalidation = true
+        eventHandler(.invalidated(change))
+    }
+
+    /// The format of the aggregate device's tap stream, which is what the IO cycle delivers.
+    private static func tapStreamFormat(of device: AudioHardwareAggregateDevice) -> AVAudioFormat? {
+        guard let streams = try? device.streams,
+              let tapStream = streams.last(where: { (try? $0.direction) == .input }),
+              var streamDescription = try? tapStream.virtualFormat else {
+            return nil
+        }
+
+        return AVAudioFormat(streamDescription: &streamDescription)
+    }
+
+    private static func currentTime() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
+    }
+}
+
+/// Routes Core Audio property notifications to the capture that asked for them.
+///
+/// Listeners are registered with a C function and client data because Core Audio
+/// matches removals on exactly that pair. Removing a Swift closure registered through
+/// `AudioObjectRemovePropertyListenerBlock` leaves it installed, which would leak a live
+/// listener on every rebuild. The client data is a token looked up here rather than an
+/// object pointer, so a notification that arrives after removal cannot reach freed memory.
+private final class PropertyListenerRegistry: @unchecked Sendable {
+    struct Token {
+        let value: Int
+
+        var clientData: UnsafeMutableRawPointer? {
+            UnsafeMutableRawPointer(bitPattern: value)
+        }
+    }
+
+    static let shared = PropertyListenerRegistry()
+
+    static let listenerProc: AudioObjectPropertyListenerProc = { _, addressCount, addresses, clientData in
+        let token = Int(bitPattern: clientData)
+        for index in 0..<Int(addressCount) {
+            PropertyListenerRegistry.shared.notify(token: token, selector: addresses[index].mSelector)
+        }
+        return noErr
+    }
+
+    private let lock = NSLock()
+    private var nextTokenValue = 1
+    private var handlers: [Int: (AudioObjectPropertySelector) -> Void] = [:]
+
+    func register(_ handler: @escaping (AudioObjectPropertySelector) -> Void) -> Token {
+        lock.withLock {
+            let value = nextTokenValue
+            nextTokenValue += 1
+            handlers[value] = handler
+            return Token(value: value)
+        }
+    }
+
+    func unregister(_ token: Token) {
+        lock.withLock {
+            handlers[token.value] = nil
+        }
+    }
+
+    private func notify(token: Int, selector: AudioObjectPropertySelector) {
+        let handler = lock.withLock { handlers[token] }
+        handler?(selector)
     }
 }
 
@@ -3044,6 +3999,30 @@ private struct AudioFormatSignature: Equatable {
         channelCount = format.channelCount
         commonFormat = format.commonFormat
         isInterleaved = format.isInterleaved
+    }
+}
+
+private extension AVAudioPCMBuffer {
+    /// A copy that owns its samples, for audio that must outlive the buffer it came in.
+    func copied() -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameLength) else {
+            return nil
+        }
+
+        copy.frameLength = frameLength
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(mutableAudioBufferList)
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+
+        for (sourceBuffer, destinationBuffer) in zip(sourceBuffers, destinationBuffers) {
+            guard let sourceData = sourceBuffer.mData,
+                  let destinationData = destinationBuffer.mData else {
+                continue
+            }
+
+            memcpy(destinationData, sourceData, Int(sourceBuffer.mDataByteSize))
+        }
+
+        return copy
     }
 }
 
@@ -3189,11 +4168,11 @@ private extension LiveTranscriptionSession {
     static let japaneseDialogueClauseLeadingPhrases = [
         "俺", "私", "僕", "うん", "いや", "や", "でも", "じゃ", "ただいま", "おかえり", "ありがとう", "ごめん"
     ]
-    static let modernVADDeferredJapaneseCommitSuffixes = [
+    static let modernVADDeferredJapaneseSuffixes = [
         "けど", "けれど", "けれども", "から", "ので", "のに", "とか", "って",
         "で", "て", "が", "を", "に", "へ", "と", "し"
     ]
-    static let modernVADDeferredEnglishCommitSuffixes = [
+    static let modernVADDeferredEnglishSuffixes = [
         " and", " or", " but", " so", " because", " if", " when", " that", " to"
     ]
     static let committedComparisonTrimCharacterSet = CharacterSet.whitespacesAndNewlines
@@ -3274,3 +4253,61 @@ private extension URL {
         return nil
     }
 }
+
+#if DEBUG
+extension LiveTranscriptionSession {
+    /// Benchmark/test hook: replays an audio file through the same ASR, VAD, timer and
+    /// commit logic a live capture uses, paced like a real device (scaled by `speed`).
+    /// Permissions and the capture device are skipped; everything downstream of
+    /// `append(audioBuffer:)` is the production path.
+    func replayForTesting(
+        audioFile: URL,
+        localeIdentifier: String,
+        modeConfig: ModeConfig = .balanced,
+        segmentation: SegmentationSettings = .default,
+        speed: Double = 1.0,
+        tailSeconds: Double = 3.0,
+        transcriptHandler: @escaping @MainActor (RecognizedSentence) -> Void,
+        partialHandler: @escaping @MainActor (DraftSegment?) -> Void
+    ) async throws {
+        self.transcriptHandler = transcriptHandler
+        self.partialHandler = partialHandler
+        self.modeConfig = modeConfig
+        self.segmentation = segmentation.clamped
+        self.activeLocaleIdentifier = localeIdentifier
+        await MainActor.run {
+            recentCommittedSentenceHistory.removeAll()
+        }
+
+        if try await configureModernSpeechRecognizer(localeIdentifier: localeIdentifier) == false {
+            try await runOnCaptureQueue {
+                try self.configureSpeechRecognizer(localeIdentifier: localeIdentifier)
+            }
+        }
+
+        let file = try AVAudioFile(forReading: audioFile)
+        let format = file.processingFormat
+        let chunkFrames = AVAudioFrameCount(format.sampleRate / 10)
+        let chunkNanoseconds = UInt64(0.1 / speed * 1_000_000_000)
+
+        while file.framePosition < file.length {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+            try file.read(into: buffer, frameCount: chunkFrames)
+            captureQueue.async { [self] in append(audioBuffer: buffer) }
+            try await Task.sleep(nanoseconds: chunkNanoseconds)
+        }
+
+        // A live device keeps delivering (silent) buffers after the speaker stops, which is
+        // what lets the VAD see the end of speech.
+        let silentTicks = Int(tailSeconds * 10)
+        for _ in 0..<silentTicks {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+            buffer.frameLength = chunkFrames
+            captureQueue.async { [self] in append(audioBuffer: buffer) }
+            try await Task.sleep(nanoseconds: chunkNanoseconds)
+        }
+
+        await stopAndWait()
+    }
+}
+#endif

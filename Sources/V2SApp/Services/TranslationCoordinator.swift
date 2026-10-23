@@ -30,6 +30,13 @@ final class TranslationCoordinator: ObservableObject {
         let text: String
     }
 
+    enum Priority {
+        /// Captions on screen or about to be shown, and live drafts.
+        case normal
+        /// Transcript-only work that runs only when no normal request is waiting.
+        case background
+    }
+
     private enum PendingOperation {
         case prepare(
             id: UUID,
@@ -42,29 +49,48 @@ final class TranslationCoordinator: ObservableObject {
             generation: Int,
             pair: LanguagePair,
             text: String,
+            priority: Priority,
             continuation: CheckedContinuation<String, Error>
         )
 
         var id: UUID {
             switch self {
-            case .prepare(let id, _, _, _), .translate(let id, _, _, _, _):
+            case .prepare(let id, _, _, _), .translate(let id, _, _, _, _, _):
                 return id
             }
         }
 
         var generation: Int {
             switch self {
-            case .prepare(_, let generation, _, _), .translate(_, let generation, _, _, _):
+            case .prepare(_, let generation, _, _), .translate(_, let generation, _, _, _, _):
                 return generation
             }
         }
 
         var pair: LanguagePair {
             switch self {
-            case .prepare(_, _, let pair, _), .translate(_, _, let pair, _, _):
+            case .prepare(_, _, let pair, _), .translate(_, _, let pair, _, _, _):
                 return pair
             }
         }
+
+        var priority: Priority {
+            switch self {
+            case .prepare:
+                return .normal
+            case .translate(_, _, _, _, let priority, _):
+                return priority
+            }
+        }
+    }
+
+    /// Which of Apple Translation's two strategies a request wants.
+    enum Fidelity: Sendable {
+        /// `lowLatency`: ~50-150 ms per sentence, plainer wording. Falls back to `.natural`
+        /// when the system, the language pair or its low-latency model does not support it.
+        case fast
+        /// The framework default (`highFidelity`): ~0.6-1.8 s per sentence, reads more naturally.
+        case natural
     }
 
     private enum OperationWaitResult {
@@ -122,6 +148,19 @@ final class TranslationCoordinator: ObservableObject {
     private var translationMemoOrder: [MemoKey] = []
     var consecutiveTimeouts: Int = 0
 
+    /// Low-latency sessions are created directly (no SwiftUI host) and run independently of
+    /// the serial host queue, so a slow high-fidelity translation never delays a draft.
+    private var fastSessions: [LanguagePair: AnyObject] = [:]
+    /// Pairs whose low-latency model is not installed on this Mac (ja<->en at the time of writing).
+    private var fastUnavailablePairs: Set<LanguagePair> = []
+
+    /// Whether the fast path has been ruled out for this pair (so callers can skip a pointless
+    /// draft translation, or label the mode honestly in the UI).
+    func isFastTranslationAvailable(from sourceIdentifier: String, to targetIdentifier: String) -> Bool {
+        guard #available(macOS 26.4, *) else { return false }
+        return fastUnavailablePairs.contains(LanguagePair(source: sourceIdentifier, target: targetIdentifier)) == false
+    }
+
     func prepareIfNeeded(
         from sourceIdentifier: String,
         to targetIdentifier: String
@@ -160,7 +199,13 @@ final class TranslationCoordinator: ObservableObject {
         }
     }
 
-    func translate(_ text: String, from sourceIdentifier: String, to targetIdentifier: String) async throws -> String {
+    func translate(
+        _ text: String,
+        from sourceIdentifier: String,
+        to targetIdentifier: String,
+        fidelity: Fidelity = .natural,
+        priority: Priority = .normal
+    ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedText.isEmpty == false else {
             return ""
@@ -171,6 +216,10 @@ final class TranslationCoordinator: ObservableObject {
         }
 
         let pair = LanguagePair(source: sourceIdentifier, target: targetIdentifier)
+        if fidelity == .fast, let fast = await translateFast(trimmedText, pair: pair) {
+            return fast
+        }
+
         if let memoized = translationMemo[MemoKey(pair: pair, text: trimmedText)] {
             return memoized
         }
@@ -190,6 +239,7 @@ final class TranslationCoordinator: ObservableObject {
                         generation: requestGeneration,
                         pair: pair,
                         text: trimmedText,
+                        priority: priority,
                         continuation: continuation
                     )
                 )
@@ -227,8 +277,8 @@ final class TranslationCoordinator: ObservableObject {
             if activeRunnerID == runnerID {
                 activeRunnerID = nil
                 signalRunnerAvailabilityWaiters()
-                if generation == runnerGeneration, let nextPair = pendingOperations.first?.pair {
-                    activate(pair: nextPair)
+                if generation == runnerGeneration, let nextIndex = nextPendingOperationIndex() {
+                    activate(pair: pendingOperations[nextIndex].pair)
                 }
             }
         }
@@ -269,7 +319,7 @@ final class TranslationCoordinator: ObservableObject {
                     finishOperation(id: id, continuation: continuation, error: error)
                 }
 
-            case .translate(let id, _, let pair, let text, let continuation):
+            case .translate(let id, _, let pair, let text, _, let continuation):
                 do {
                     let response = try await session.translate(text)
                     let translatedText = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -293,7 +343,51 @@ final class TranslationCoordinator: ObservableObject {
         }
     }
 
+    /// Direct low-latency translation. Returns nil whenever the fast path cannot serve the
+    /// request, in which case the caller falls back to the regular (natural) queue.
+    private func translateFast(_ text: String, pair: LanguagePair) async -> String? {
+        guard #available(macOS 26.4, *), fastUnavailablePairs.contains(pair) == false else {
+            return nil
+        }
+
+        // The direct session only works for installed languages; leave downloads to the host path.
+        guard let status = try? await availabilityStatus(for: pair), status == .installed else {
+            return nil
+        }
+
+        let requestGeneration = generation
+        let session = fastSession(for: pair)
+        do {
+            let response = try await session.translate(text)
+            guard requestGeneration == generation else { return nil }
+            let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return translated.isEmpty ? nil : translated
+        } catch TranslationError.notInstalled {
+            fastUnavailablePairs.insert(pair)
+            fastSessions.removeValue(forKey: pair)
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    @available(macOS 26.4, *)
+    private func fastSession(for pair: LanguagePair) -> TranslationSession {
+        if let existing = fastSessions[pair] as? TranslationSession {
+            return existing
+        }
+        let session = TranslationSession(
+            installedSource: Locale.Language(identifier: localeIdentifier(for: pair.source)),
+            target: Locale.Language(identifier: localeIdentifier(for: pair.target)),
+            preferredStrategy: .lowLatency
+        )
+        fastSessions[pair] = session
+        return session
+    }
+
     func reset() {
+        fastSessions.removeAll()
+        fastUnavailablePairs.removeAll()
         generation &+= 1
         cancelOutstandingOperations()
         currentPair = nil
@@ -407,9 +501,17 @@ final class TranslationCoordinator: ObservableObject {
         switch operation {
         case .prepare(_, _, _, let continuation):
             continuation.resume(throwing: CancellationError())
-        case .translate(_, _, _, _, let continuation):
+        case .translate(_, _, _, _, _, let continuation):
             continuation.resume(throwing: CancellationError())
         }
+    }
+
+    /// First queued operation to run: normal requests go ahead of background ones.
+    private func nextPendingOperationIndex(
+        where matches: (PendingOperation) -> Bool = { _ in true }
+    ) -> Int? {
+        pendingOperations.firstIndex { matches($0) && $0.priority == .normal }
+            ?? pendingOperations.firstIndex(where: matches)
     }
 
     @available(macOS 15.0, *)
@@ -425,9 +527,15 @@ final class TranslationCoordinator: ObservableObject {
                 return nil
             }
 
-            if let index = pendingOperations.firstIndex(where: {
+            if let index = nextPendingOperationIndex(where: {
                 $0.pair == pair && $0.generation == generation
             }) {
+                // Only background work is left for this pair: yield to another pair's
+                // normal work first. The runner exit activates that pair.
+                if pendingOperations[index].priority == .background,
+                   pendingOperations.contains(where: { $0.priority == .normal && $0.generation == generation }) {
+                    return nil
+                }
                 return pendingOperations.remove(at: index)
             }
 

@@ -54,6 +54,43 @@ enum AppTextKey: String {
     case attachToSource
     case invisibleInRecording
     case invisibleInRecordingHint
+    case conversation
+    case exportTranscript
+    case exportMarkdown
+    case exportPlainText
+    case jumpToLatest
+    case transcriptExportTitle
+    case segmentationSection
+    case segmentationEnabled
+    case segmentationHelp
+    case maxContinuousSpeech
+    case stableLeadingDelay
+    case cutAtJapaneseClauseEndings
+    case translationQuality
+    case translationModeProgressive
+    case translationModeNaturalOnly
+    case translationModeFastOnly
+    case translationModeHelp
+    case cleanSpokenText
+    case cleanSpokenTextHint
+    case readingGlossary
+    case readingGlossaryHint
+    case readingGlossaryTerm
+    case readingGlossaryReading
+    case readingGlossaryEmpty
+    case importFile
+    case overlayPosition
+    case overlayPositionTop
+    case overlayPositionBottom
+    case overlayTheme
+    case overlayThemeDark
+    case overlayThemeLight
+    case overlayThemeContrast
+    case overlayThemeColorful
+    case polishTranslations
+    case polishTranslationsHint
+    case polishUnsupportedLanguage
+    case polishUnavailable
     case subtitleColor
     case sourceSubtitleColor
     case backgroundColor
@@ -144,6 +181,7 @@ enum AppTextKey: String {
     case missingMicrophoneDevice
     case missingApplicationFormat
     case applicationNotProducingAudioFormat
+    case applicationAudioLostFormat
     case failedToStartCaptureFormat
     case sileroVadUnavailableFallbackFormat
     case speechRecognitionStoppedFormat
@@ -158,10 +196,8 @@ enum AppTextKey: String {
     case failedToConvertCapturedAudioForSpeechRecognition
     case failedToAllocateSpeechAnalyzerAudioBuffer
     case failedToConvertCapturedAudioForSpeechAnalyzer
-    case noOutputAudioDeviceForAppCapture
     case selectedAppAudioFormatCouldNotBePrepared
     case failedToStageWithReasonFormat
-    case failedToReadCapturedAudioStreamFormat
     case scrollToLatestSubtitle
     case resetOverlaySize
     case transcript
@@ -349,6 +385,43 @@ enum AppLocalization {
             "attachToSource": "Attach to Source",
             "invisibleInRecording": "Invisible in Recording",
             "invisibleInRecordingHint": "Subtitles stay on your screen but are left out of screen recordings, screenshots, and shared screens.",
+            "conversation": "Conversation",
+            "exportTranscript": "Export…",
+            "exportMarkdown": "Markdown (.md)",
+            "exportPlainText": "Plain text (.txt)",
+            "jumpToLatest": "Jump to latest",
+            "transcriptExportTitle": "v2s transcript",
+            "segmentationSection": "Subtitle segmentation",
+            "segmentationEnabled": "Punctuation-aware segmentation",
+            "segmentationHelp": "Commits finished sentences while the speaker keeps talking, and cuts inside a long sentence only after the limit below.",
+            "maxContinuousSpeech": "Max continuous speech",
+            "stableLeadingDelay": "Commit stability",
+            "cutAtJapaneseClauseEndings": "Also cut at Japanese clause endings (けど・ので・から)",
+            "translationQuality": "Translation quality",
+            "translationModeProgressive": "Fast, then natural",
+            "translationModeNaturalOnly": "Natural only",
+            "translationModeFastOnly": "Fast only",
+            "translationModeHelp": "Fast shows a plain translation in about 0.1 s and replaces it with the natural one when ready. Pairs without a fast model (such as Japanese ↔ English on some Macs) use the natural translation only.",
+            "cleanSpokenText": "Remove fillers before translating",
+            "cleanSpokenTextHint": "Drops えーと, あの, um… from the text sent to the translator. The original subtitle is unchanged.",
+            "readingGlossary": "Names & terms by sound",
+            "readingGlossaryHint": "Fixes names the recognizer spells wrong but hears right, before display and translation.",
+            "readingGlossaryTerm": "Term (e.g. 石橋誠)",
+            "readingGlossaryReading": "Reading (e.g. いしばしまこと)",
+            "readingGlossaryEmpty": "No names or terms yet.",
+            "importFile": "Import…",
+            "overlayPosition": "Position",
+            "overlayPositionTop": "Top of screen",
+            "overlayPositionBottom": "Above the Dock",
+            "overlayTheme": "Color theme",
+            "overlayThemeDark": "Dark",
+            "overlayThemeLight": "Light",
+            "overlayThemeContrast": "High contrast",
+            "overlayThemeColorful": "Colorful",
+            "polishTranslations": "Polish translations with Apple Intelligence",
+            "polishTranslationsHint": "After the natural translation, rewrites it on this Mac (never online) when it is ready, within 2.5 s. Off by default; it can add 1–3 s before the final wording appears.",
+            "polishUnsupportedLanguage": "Apple Intelligence does not support %@ on this Mac, so polishing is unavailable for this output language.",
+            "polishUnavailable": "Apple Intelligence is not available on this Mac right now.",
             "subtitleColor": "Translation Color",
             "sourceSubtitleColor": "Original Text Color",
             "backgroundColor": "Background Color",
@@ -439,6 +512,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "The selected microphone is no longer available.",
             "missingApplicationFormat": "The selected app, %@, is no longer available.",
             "applicationNotProducingAudioFormat": "%@ is not producing app audio yet. Start playback in the app, then try again.",
+            "applicationAudioLostFormat": "Lost the audio from %@ and could not reconnect. Click Start to try again.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD unavailable: %@. Falling back to ASR-based silence detection.",
             "speechRecognitionStoppedFormat": "Speech recognition stopped: %@",
@@ -453,10 +527,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "Failed to convert captured audio for speech recognition",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "Failed to allocate a SpeechAnalyzer audio buffer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "Failed to convert captured audio for SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "No output audio device is available for app capture.",
             "selectedAppAudioFormatCouldNotBePrepared": "The selected app's audio format could not be prepared for capture.",
             "failedToStageWithReasonFormat": "Failed to %@: %@",
-            "failedToReadCapturedAudioStreamFormat": "Failed to read the captured audio stream for %@.",
             "scrollToLatestSubtitle": "Scroll to latest subtitle",
             "resetOverlaySize": "Reset overlay size",
             "transcript": "Transcript",
@@ -614,6 +686,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "所选麦克风已不可用。",
             "missingApplicationFormat": "所选应用 %@ 已不可用。",
             "applicationNotProducingAudioFormat": "%@ 目前还没有输出应用音频。请先在应用中开始播放，再重试。",
+            "applicationAudioLostFormat": "%@ 的音频已中断，且无法重新连接。请点击“开始”重试。",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD 不可用：%@。将回退到基于 ASR 的静音检测。",
             "speechRecognitionStoppedFormat": "语音识别已停止：%@",
@@ -628,10 +701,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "无法将采集音频转换为语音识别格式",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "无法分配 SpeechAnalyzer 音频缓冲区。",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "无法将采集音频转换为 SpeechAnalyzer 格式",
-            "noOutputAudioDeviceForAppCapture": "应用采集没有可用的输出音频设备。",
             "selectedAppAudioFormatCouldNotBePrepared": "无法为采集准备所选应用的音频格式。",
             "failedToStageWithReasonFormat": "无法%@：%@",
-            "failedToReadCapturedAudioStreamFormat": "无法读取 %@ 的采集音频流。",
             "scrollToLatestSubtitle": "滚动到最新字幕",
             "resetOverlaySize": "重置字幕窗大小",
             "transcript": "字幕记录",
@@ -789,6 +860,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "El micrófono seleccionado ya no está disponible.",
             "missingApplicationFormat": "La app seleccionada, %@, ya no está disponible.",
             "applicationNotProducingAudioFormat": "%@ aún no está produciendo audio de la app. Inicia la reproducción y vuelve a intentarlo.",
+            "applicationAudioLostFormat": "Se perdió el audio de %@ y no se pudo volver a conectar. Haz clic en Iniciar para volver a intentarlo.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD no disponible: %@. Se usará detección de silencio basada en ASR.",
             "speechRecognitionStoppedFormat": "El reconocimiento de voz se detuvo: %@",
@@ -803,10 +875,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "No se pudo convertir el audio capturado para reconocimiento de voz",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "No se pudo asignar un búfer de audio para SpeechAnalyzer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "No se pudo convertir el audio capturado para SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "No hay un dispositivo de salida de audio disponible para la captura de apps.",
             "selectedAppAudioFormatCouldNotBePrepared": "No se pudo preparar el formato de audio de la app seleccionada para la captura.",
             "failedToStageWithReasonFormat": "No se pudo %@: %@",
-            "failedToReadCapturedAudioStreamFormat": "No se pudo leer el flujo de audio capturado de %@.",
             "scrollToLatestSubtitle": "Ir al subtítulo más reciente",
             "resetOverlaySize": "Restablecer tamaño del overlay",
             "transcript": "Transcripción",
@@ -964,6 +1034,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "Das ausgewählte Mikrofon ist nicht mehr verfügbar.",
             "missingApplicationFormat": "Die ausgewählte App %@ ist nicht mehr verfügbar.",
             "applicationNotProducingAudioFormat": "%@ gibt noch kein App-Audio aus. Starte die Wiedergabe in der App und versuche es erneut.",
+            "applicationAudioLostFormat": "Der Ton von %@ ist abgebrochen und konnte nicht wiederhergestellt werden. Klicke auf „Starten“, um es erneut zu versuchen.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD nicht verfügbar: %@. Es wird auf ASR-basierte Stilleerkennung zurückgegriffen.",
             "speechRecognitionStoppedFormat": "Spracherkennung wurde gestoppt: %@",
@@ -978,10 +1049,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "Erfasstes Audio konnte nicht für die Spracherkennung konvertiert werden",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "Ein Audiopuffer für SpeechAnalyzer konnte nicht reserviert werden.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "Erfasstes Audio konnte nicht für SpeechAnalyzer konvertiert werden",
-            "noOutputAudioDeviceForAppCapture": "Für die App-Aufnahme ist kein Audioausgabegerät verfügbar.",
             "selectedAppAudioFormatCouldNotBePrepared": "Das Audioformat der ausgewählten App konnte nicht für die Aufnahme vorbereitet werden.",
             "failedToStageWithReasonFormat": "%@ fehlgeschlagen: %@",
-            "failedToReadCapturedAudioStreamFormat": "Der erfasste Audiostream von %@ konnte nicht gelesen werden.",
             "scrollToLatestSubtitle": "Zum neuesten Untertitel scrollen",
             "resetOverlaySize": "Overlay-Größe zurücksetzen",
             "transcript": "Transkript",
@@ -1049,6 +1118,43 @@ enum AppLocalization {
             "attachToSource": "ソースに追従",
             "invisibleInRecording": "録画に映さない",
             "invisibleInRecordingHint": "字幕は画面に表示されたまま、画面収録・スクリーンショット・画面共有には映りません。",
+            "conversation": "会話",
+            "exportTranscript": "書き出し…",
+            "exportMarkdown": "Markdown (.md)",
+            "exportPlainText": "テキスト (.txt)",
+            "jumpToLatest": "最新へ移動",
+            "transcriptExportTitle": "v2s トランスクリプト",
+            "segmentationSection": "字幕の区切り",
+            "segmentationEnabled": "句読点を使った区切り",
+            "segmentationHelp": "話し続けている間も文が終わった時点で確定し、長い文は下の上限を超えたときだけ途中で区切ります。",
+            "maxContinuousSpeech": "連続発話の上限",
+            "stableLeadingDelay": "確定までの安定時間",
+            "cutAtJapaneseClauseEndings": "日本語の節末（けど・ので・から）でも区切る",
+            "translationQuality": "翻訳の品質",
+            "translationModeProgressive": "まず速く、その後自然に",
+            "translationModeNaturalOnly": "自然な翻訳のみ",
+            "translationModeFastOnly": "高速のみ",
+            "translationModeHelp": "高速モードは約0.1秒で簡易訳を表示し、自然な訳が出来たら置き換えます。高速モデルのない言語ペアでは自然な翻訳のみになります。",
+            "cleanSpokenText": "翻訳前にフィラーを除去",
+            "cleanSpokenTextHint": "翻訳に送るテキストから「えーと」「あの」などを除きます。原文字幕は変わりません。",
+            "readingGlossary": "名前・用語（読みで補正）",
+            "readingGlossaryHint": "認識結果の名前や用語を、綴りではなく読みで照合して表示・翻訳の前に補正します。",
+            "readingGlossaryTerm": "用語（例: 石橋誠）",
+            "readingGlossaryReading": "読み（例: いしばしまこと）",
+            "readingGlossaryEmpty": "まだ登録がありません。",
+            "importFile": "読み込み…",
+            "overlayPosition": "表示位置",
+            "overlayPositionTop": "画面の上",
+            "overlayPositionBottom": "Dock の上",
+            "overlayTheme": "配色テーマ",
+            "overlayThemeDark": "ダーク",
+            "overlayThemeLight": "ライト",
+            "overlayThemeContrast": "高コントラスト",
+            "overlayThemeColorful": "カラフル",
+            "polishTranslations": "Apple Intelligence で訳文を整える",
+            "polishTranslationsHint": "自然な訳が出た後、このMac上で（オンラインには送らず）2.5秒以内に書き換えます。既定はオフで、最終的な表現が出るまで1〜3秒余計にかかることがあります。",
+            "polishUnsupportedLanguage": "このMacの Apple Intelligence は %@ に対応していないため、この出力言語では使えません。",
+            "polishUnavailable": "このMacでは現在 Apple Intelligence を利用できません。",
             "subtitleColor": "訳文の色",
             "sourceSubtitleColor": "原文の色",
             "backgroundColor": "背景色",
@@ -1139,6 +1245,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "選択したマイクは利用できなくなりました。",
             "missingApplicationFormat": "選択したアプリ %@ は利用できなくなりました。",
             "applicationNotProducingAudioFormat": "%@ はまだアプリ音声を出力していません。アプリで再生を開始してから、もう一度試してください。",
+            "applicationAudioLostFormat": "%@ の音声が途切れ、再接続できませんでした。「開始」をクリックしてもう一度試してください。",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD は利用できません: %@。ASR ベースの無音検出にフォールバックします。",
             "speechRecognitionStoppedFormat": "音声認識が停止しました: %@",
@@ -1153,10 +1260,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "キャプチャ音声を音声認識用に変換できませんでした",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "SpeechAnalyzer 用のオーディオバッファを確保できませんでした。",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "キャプチャ音声を SpeechAnalyzer 用に変換できませんでした",
-            "noOutputAudioDeviceForAppCapture": "アプリキャプチャに利用できる出力オーディオデバイスがありません。",
             "selectedAppAudioFormatCouldNotBePrepared": "選択したアプリの音声フォーマットをキャプチャ用に準備できませんでした。",
             "failedToStageWithReasonFormat": "%@ に失敗しました: %@",
-            "failedToReadCapturedAudioStreamFormat": "%@ のキャプチャ音声ストリームを読み取れませんでした。",
             "scrollToLatestSubtitle": "最新の字幕へ移動",
             "resetOverlaySize": "オーバーレイのサイズをリセット",
             "transcript": "トランスクリプト",
@@ -1314,6 +1419,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "Le microphone sélectionné n'est plus disponible.",
             "missingApplicationFormat": "L'app sélectionnée, %@, n'est plus disponible.",
             "applicationNotProducingAudioFormat": "%@ ne produit pas encore d'audio d'app. Lancez la lecture dans l'app, puis réessayez.",
+            "applicationAudioLostFormat": "L'audio de %@ a été perdu et la reconnexion a échoué. Cliquez sur Démarrer pour réessayer.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD indisponible : %@. Retour à une détection de silence basée sur l'ASR.",
             "speechRecognitionStoppedFormat": "La reconnaissance vocale s'est arrêtée : %@",
@@ -1328,10 +1434,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "Impossible de convertir l'audio capturé pour la reconnaissance vocale",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "Impossible d'allouer un tampon audio pour SpeechAnalyzer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "Impossible de convertir l'audio capturé pour SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "Aucun périphérique de sortie audio n'est disponible pour la capture d'app.",
             "selectedAppAudioFormatCouldNotBePrepared": "Le format audio de l'app sélectionnée n'a pas pu être préparé pour la capture.",
             "failedToStageWithReasonFormat": "Impossible de %@ : %@",
-            "failedToReadCapturedAudioStreamFormat": "Impossible de lire le flux audio capturé pour %@.",
             "scrollToLatestSubtitle": "Aller au sous-titre le plus récent",
             "resetOverlaySize": "Réinitialiser la taille de l'overlay",
             "transcript": "Transcription",
@@ -1489,6 +1593,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "선택한 마이크를 더 이상 사용할 수 없습니다.",
             "missingApplicationFormat": "선택한 앱 %@ 을(를) 더 이상 사용할 수 없습니다.",
             "applicationNotProducingAudioFormat": "%@ 에서 아직 앱 오디오가 나오지 않습니다. 앱에서 재생을 시작한 뒤 다시 시도하세요.",
+            "applicationAudioLostFormat": "%@ 의 오디오가 끊겼고 다시 연결하지 못했습니다. 시작을 클릭해 다시 시도하세요.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD 를 사용할 수 없음: %@. ASR 기반 무음 감지로 대체합니다.",
             "speechRecognitionStoppedFormat": "음성 인식이 중지되었습니다: %@",
@@ -1503,10 +1608,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "캡처된 오디오를 음성 인식용으로 변환할 수 없습니다",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "SpeechAnalyzer 용 오디오 버퍼를 할당할 수 없습니다.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "캡처된 오디오를 SpeechAnalyzer 용으로 변환할 수 없습니다",
-            "noOutputAudioDeviceForAppCapture": "앱 캡처에 사용할 수 있는 출력 오디오 장치가 없습니다.",
             "selectedAppAudioFormatCouldNotBePrepared": "선택한 앱의 오디오 형식을 캡처용으로 준비할 수 없습니다.",
             "failedToStageWithReasonFormat": "%@ 실패: %@",
-            "failedToReadCapturedAudioStreamFormat": "%@ 의 캡처된 오디오 스트림을 읽을 수 없습니다.",
             "scrollToLatestSubtitle": "최신 자막으로 이동",
             "resetOverlaySize": "오버레이 크기 재설정",
             "transcript": "기록",
@@ -1664,6 +1767,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "لم يعد الميكروفون المحدد متاحًا.",
             "missingApplicationFormat": "لم يعد التطبيق المحدد %@ متاحًا.",
             "applicationNotProducingAudioFormat": "%@ لا يُخرج صوت التطبيق بعد. ابدأ التشغيل في التطبيق ثم حاول مرة أخرى.",
+            "applicationAudioLostFormat": "انقطع صوت %@ وتعذّرت إعادة الاتصال. انقر على ابدأ لإعادة المحاولة.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "\u{200F}Silero VAD غير متاح: %@. سيتم الرجوع إلى اكتشاف الصمت المعتمد على ASR.",
             "speechRecognitionStoppedFormat": "تم إيقاف التعرّف على الكلام: %@",
@@ -1678,10 +1782,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "تعذر تحويل الصوت الملتقط للتعرّف على الكلام",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "تعذر تخصيص مخزن صوتي لـ SpeechAnalyzer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "تعذر تحويل الصوت الملتقط لـ SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "لا يوجد جهاز إخراج صوتي متاح لالتقاط صوت التطبيق.",
             "selectedAppAudioFormatCouldNotBePrepared": "تعذر تجهيز تنسيق الصوت الخاص بالتطبيق المحدد للالتقاط.",
             "failedToStageWithReasonFormat": "تعذر %@: %@",
-            "failedToReadCapturedAudioStreamFormat": "تعذر قراءة دفق الصوت الملتقط لـ %@.",
             "scrollToLatestSubtitle": "الانتقال إلى أحدث ترجمة",
             "resetOverlaySize": "إعادة تعيين حجم التراكب",
             "transcript": "النص المكتوب",
@@ -1839,6 +1941,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "O microfone selecionado não está mais disponível.",
             "missingApplicationFormat": "O app selecionado, %@, não está mais disponível.",
             "applicationNotProducingAudioFormat": "%@ ainda não está produzindo áudio do app. Inicie a reprodução no app e tente novamente.",
+            "applicationAudioLostFormat": "O áudio de %@ foi perdido e não foi possível reconectar. Clique em Iniciar para tentar novamente.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD indisponível: %@. Usando detecção de silêncio baseada em ASR.",
             "speechRecognitionStoppedFormat": "O reconhecimento de fala foi interrompido: %@",
@@ -1853,10 +1956,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "Não foi possível converter o áudio capturado para reconhecimento de fala",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "Não foi possível alocar um buffer de áudio para SpeechAnalyzer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "Não foi possível converter o áudio capturado para SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "Nenhum dispositivo de saída de áudio está disponível para captura de apps.",
             "selectedAppAudioFormatCouldNotBePrepared": "Não foi possível preparar o formato de áudio do app selecionado para captura.",
             "failedToStageWithReasonFormat": "Falha ao %@: %@",
-            "failedToReadCapturedAudioStreamFormat": "Não foi possível ler o fluxo de áudio capturado de %@.",
             "scrollToLatestSubtitle": "Ir para a legenda mais recente",
             "resetOverlaySize": "Redefinir tamanho da sobreposição",
             "transcript": "Transcrição",
@@ -2014,6 +2115,7 @@ enum AppLocalization {
             "missingMicrophoneDevice": "Выбранный микрофон больше недоступен.",
             "missingApplicationFormat": "Выбранное приложение %@ больше недоступно.",
             "applicationNotProducingAudioFormat": "%@ пока не воспроизводит звук приложения. Запустите воспроизведение и попробуйте снова.",
+            "applicationAudioLostFormat": "Звук из %@ пропал, и переподключиться не удалось. Нажмите «Запустить», чтобы повторить попытку.",
             "failedToStartCaptureFormat": "%@",
             "sileroVadUnavailableFallbackFormat": "Silero VAD недоступен: %@. Используется определение тишины на основе ASR.",
             "speechRecognitionStoppedFormat": "Распознавание речи остановлено: %@",
@@ -2028,10 +2130,8 @@ enum AppLocalization {
             "failedToConvertCapturedAudioForSpeechRecognition": "Не удалось преобразовать захваченный звук для распознавания речи",
             "failedToAllocateSpeechAnalyzerAudioBuffer": "Не удалось выделить аудиобуфер для SpeechAnalyzer.",
             "failedToConvertCapturedAudioForSpeechAnalyzer": "Не удалось преобразовать захваченный звук для SpeechAnalyzer",
-            "noOutputAudioDeviceForAppCapture": "Для захвата звука приложения нет доступного выходного аудиоустройства.",
             "selectedAppAudioFormatCouldNotBePrepared": "Не удалось подготовить аудиоформат выбранного приложения для захвата.",
             "failedToStageWithReasonFormat": "Не удалось %@: %@",
-            "failedToReadCapturedAudioStreamFormat": "Не удалось прочитать захваченный аудиопоток для %@.",
             "scrollToLatestSubtitle": "Прокрутить к последнему субтитру",
             "resetOverlaySize": "Сбросить размер оверлея",
             "transcript": "Транскрипция",
